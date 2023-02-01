@@ -21,4 +21,4 @@ A library for distributed computation.  See documentation_ for more details.
 .. |NumFOCUS| image:: https://img.shields.io/badge/powered%20by-NumFOCUS-orange.svg?style=flat&colorA=E1523D&colorB=007D8A
    :target: https://www.numfocus.org/
 
-This repository is identical to `https://github.com/aamirshafi/distributed.git`, which is the distributed library for MPI4Dask 0.3 release.
+This repository is created from `https://github.com/aamirshafi/distributed.git`, which is the distributed library for MPI4Dask 0.3 release.
