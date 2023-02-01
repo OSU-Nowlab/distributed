@@ -1,21 +1,17 @@
-from __future__ import annotations
-
 import asyncio
-import logging
-import random
 from collections import defaultdict
 from functools import partial
 from itertools import cycle
-from typing import Any, Callable
+import logging
+import random
 
-from tlz import concat, drop, groupby, merge
-
-import dask.config
 from dask.optimization import SubgraphCallable
-from dask.utils import is_namedtuple_instance, parse_timedelta, stringify
+import dask.config
+from dask.utils import parse_timedelta, stringify
+from tlz import merge, concat, groupby, drop
 
-from distributed.core import rpc
-from distributed.utils import All
+from .core import rpc
+from .utils import All
 
 logger = logging.getLogger(__name__)
 
@@ -36,7 +32,7 @@ async def gather_from_workers(who_has, rpc, close=True, serializers=None, who=No
     gather
     _gather
     """
-    from distributed.worker import get_data_from_worker
+    from .worker import get_data_from_worker
 
     bad_addresses = set()
     missing_workers = set()
@@ -60,33 +56,38 @@ async def gather_from_workers(who_has, rpc, close=True, serializers=None, who=No
                 bad_keys.add(key)
         if bad_keys:
             all_bad_keys |= bad_keys
-        coroutines = {
-            address: asyncio.create_task(
-                get_data_from_worker(
-                    rpc,
-                    keys,
-                    address,
-                    who=who,
-                    serializers=serializers,
-                    max_connections=False,
-                ),
-                name=f"get-data-from-{address}",
-            )
-            for address, keys in d.items()
-        }
-        response = {}
-        for worker, c in coroutines.items():
-            try:
-                r = await c
-            except OSError:
-                missing_workers.add(worker)
-            except ValueError as e:
-                logger.info(
-                    "Got an unexpected error while collecting from workers: %s", e
+
+        rpcs = {addr: rpc(addr) for addr in d}
+        try:
+            coroutines = {
+                address: asyncio.ensure_future(
+                    get_data_from_worker(
+                        rpc,
+                        keys,
+                        address,
+                        who=who,
+                        serializers=serializers,
+                        max_connections=False,
+                    )
                 )
-                missing_workers.add(worker)
-            else:
-                response.update(r["data"])
+                for address, keys in d.items()
+            }
+            response = {}
+            for worker, c in coroutines.items():
+                try:
+                    r = await c
+                except EnvironmentError:
+                    missing_workers.add(worker)
+                except ValueError as e:
+                    logger.info(
+                        "Got an unexpected error while collecting from workers: %s", e
+                    )
+                    missing_workers.add(worker)
+                else:
+                    response.update(r["data"])
+        finally:
+            for r in rpcs.values():
+                await r.close_rpc()
 
         bad_addresses |= {v for k, v in rev.items() if k not in response}
         results.update(response)
@@ -110,13 +111,13 @@ class WrappedKey:
         self.key = key
 
     def __repr__(self):
-        return f"{type(self).__name__}('{self.key}')"
+        return "%s('%s')" % (type(self).__name__, self.key)
 
 
 _round_robin_counter = [0]
 
 
-async def scatter_to_workers(nthreads, data, rpc=rpc, report=True):
+async def scatter_to_workers(nthreads, data, rpc=rpc, report=True, serializers=None):
     """Scatter data directly to workers
 
     This distributes data in a round-robin fashion to a set of workers based on
@@ -143,8 +144,7 @@ async def scatter_to_workers(nthreads, data, rpc=rpc, report=True):
         out = await All(
             [
                 rpcs[address].update_data(
-                    data=v,
-                    report=report,
+                    data=v, report=report, serializers=serializers
                 )
                 for address, v in d.items()
             ]
@@ -163,90 +163,7 @@ async def scatter_to_workers(nthreads, data, rpc=rpc, report=True):
 collection_types = (tuple, list, set, frozenset)
 
 
-def _namedtuple_packing(o: Any, handler: Callable[..., Any]) -> Any:
-    """Special pack/unpack dispatcher for namedtuples respecting their potential constructors."""
-    assert is_namedtuple_instance(o)
-    typ = type(o)
-    if hasattr(o, "__getnewargs_ex__"):
-        args, kwargs = o.__getnewargs_ex__()
-        handled_args = [handler(item) for item in args]
-        handled_kwargs = {k: handler(v) for k, v in kwargs.items()}
-        return typ(*handled_args, **handled_kwargs)
-    args = o.__getnewargs__() if hasattr(typ, "__getnewargs__") else o
-    handled_args = [handler(item) for item in args]
-    return typ(*handled_args)
-
-
-def _unpack_remotedata_inner(
-    o: Any, byte_keys: bool, found_keys: set[WrappedKey]
-) -> Any:
-    """Inner implementation of `unpack_remotedata` that adds found wrapped keys to `found_keys`"""
-
-    typ = type(o)
-    if typ is tuple:
-        if not o:
-            return o
-        if type(o[0]) is SubgraphCallable:
-
-            # Unpack futures within the arguments of the subgraph callable
-            futures: set[WrappedKey] = set()
-            args = tuple(_unpack_remotedata_inner(i, byte_keys, futures) for i in o[1:])
-            found_keys.update(futures)
-
-            # Unpack futures within the subgraph callable itself
-            sc: SubgraphCallable = o[0]
-            futures = set()
-            dsk = {
-                k: _unpack_remotedata_inner(v, byte_keys, futures)
-                for k, v in sc.dsk.items()
-            }
-            future_keys: tuple = ()
-            if futures:  # If no futures is in the subgraph, we just use `sc` as-is
-                found_keys.update(futures)
-                future_keys = (
-                    tuple(stringify(f.key) for f in futures)
-                    if byte_keys
-                    else tuple(f.key for f in futures)
-                )
-                inkeys = tuple(sc.inkeys) + future_keys
-                sc = SubgraphCallable(dsk, sc.outkey, inkeys, sc.name)
-            return (sc,) + args + future_keys
-        else:
-            return tuple(
-                _unpack_remotedata_inner(item, byte_keys, found_keys) for item in o
-            )
-    elif is_namedtuple_instance(o):
-        return _namedtuple_packing(
-            o,
-            partial(
-                _unpack_remotedata_inner, byte_keys=byte_keys, found_keys=found_keys
-            ),
-        )
-
-    if typ in collection_types:
-        if not o:
-            return o
-        outs = [_unpack_remotedata_inner(item, byte_keys, found_keys) for item in o]
-        return typ(outs)
-    elif typ is dict:
-        if o:
-            return {
-                k: _unpack_remotedata_inner(v, byte_keys, found_keys)
-                for k, v in o.items()
-            }
-        else:
-            return o
-    elif issubclass(typ, WrappedKey):  # TODO use type is Future
-        k = o.key
-        if byte_keys:
-            k = stringify(k)
-        found_keys.add(o)
-        return k
-    else:
-        return o
-
-
-def unpack_remotedata(o: Any, byte_keys: bool = False) -> tuple[Any, set]:
+def unpack_remotedata(o, byte_keys=False, myset=None):
     """Unpack WrappedKey objects from collection
 
     Returns original collection and set of all found WrappedKey objects
@@ -273,8 +190,58 @@ def unpack_remotedata(o: Any, byte_keys: bool = False) -> tuple[Any, set]:
     >>> unpack_remotedata(rd, byte_keys=True)
     ("('x', 1)", {WrappedKey('('x', 1)')})
     """
-    found_keys: set[Any] = set()
-    return _unpack_remotedata_inner(o, byte_keys, found_keys), found_keys
+    if myset is None:
+        myset = set()
+        out = unpack_remotedata(o, byte_keys, myset)
+        return out, myset
+
+    typ = type(o)
+
+    if typ is tuple:
+        if not o:
+            return o
+        if type(o[0]) is SubgraphCallable:
+            sc = o[0]
+            futures = set()
+            dsk = {
+                k: unpack_remotedata(v, byte_keys, futures) for k, v in sc.dsk.items()
+            }
+            args = tuple(unpack_remotedata(i, byte_keys, futures) for i in o[1:])
+            if futures:
+                myset.update(futures)
+                futures = (
+                    tuple(stringify(f.key) for f in futures)
+                    if byte_keys
+                    else tuple(f.key for f in futures)
+                )
+                inkeys = sc.inkeys + futures
+                return (
+                    (SubgraphCallable(dsk, sc.outkey, inkeys, sc.name),)
+                    + args
+                    + futures
+                )
+            else:
+                return o
+        else:
+            return tuple(unpack_remotedata(item, byte_keys, myset) for item in o)
+    if typ in collection_types:
+        if not o:
+            return o
+        outs = [unpack_remotedata(item, byte_keys, myset) for item in o]
+        return typ(outs)
+    elif typ is dict:
+        if o:
+            return {k: unpack_remotedata(v, byte_keys, myset) for k, v in o.items()}
+        else:
+            return o
+    elif issubclass(typ, WrappedKey):  # TODO use type is Future
+        k = o.key
+        if byte_keys:
+            k = stringify(k)
+        myset.add(o)
+        return k
+    else:
+        return o
 
 
 def pack_data(o, d, key_types=object):
@@ -282,9 +249,9 @@ def pack_data(o, d, key_types=object):
 
     Parameters
     ----------
-    o
+    o:
         core data structures containing literals and keys
-    d : dict
+    d: dict
         mapping of keys to data
 
     Examples
@@ -308,8 +275,6 @@ def pack_data(o, d, key_types=object):
         return typ([pack_data(x, d, key_types=key_types) for x in o])
     elif typ is dict:
         return {k: pack_data(v, d, key_types=key_types) for k, v in o.items()}
-    elif is_namedtuple_instance(o):
-        return _namedtuple_packing(o, partial(pack_data, d=d, key_types=key_types))
     else:
         return o
 
@@ -319,9 +284,9 @@ def subs_multiple(o, d):
 
     Parameters
     ----------
-    o
+    o:
         Core data structures containing literals and keys
-    d : dict
+    d: dict
         Mapping of keys to values
 
     Examples
@@ -386,7 +351,7 @@ async def retry(
     Returns
     -------
     Any
-        Whatever `await coro()` returned
+        Whatever `await `coro()` returned
     """
     # this loop is a no-op in case max_retries<=0
     for i_try in range(count):
@@ -397,7 +362,7 @@ async def retry(
             logger.info(
                 f"Retrying {operation} after exception in attempt {i_try}/{count}: {ex}"
             )
-            delay = min(delay_min * (2**i_try - 1), delay_max)
+            delay = min(delay_min * (2 ** i_try - 1), delay_max)
             if jitter_fraction > 0:
                 delay *= 1 + random.random() * jitter_fraction
             await asyncio.sleep(delay)

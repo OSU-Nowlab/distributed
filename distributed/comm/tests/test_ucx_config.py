@@ -1,18 +1,12 @@
-from __future__ import annotations
-
-import os
+import pytest
 from time import sleep
 
-import pytest
-
-pytestmark = pytest.mark.gpu
-
 import dask
-
+from dask.utils import format_bytes
 from distributed import Client
-from distributed.comm.ucx import _prepare_ucx_config
+from distributed.utils_test import gen_test, loop, inc, cleanup, popen  # noqa: 401
 from distributed.utils import get_ip
-from distributed.utils_test import gen_test, popen
+from distributed.comm.ucx import _scrub_ucx_config
 
 try:
     HOST = get_ip()
@@ -23,129 +17,88 @@ ucp = pytest.importorskip("ucp")
 rmm = pytest.importorskip("rmm")
 
 
-@gen_test()
-async def test_ucx_config(ucx_loop, cleanup):
+@pytest.mark.asyncio
+async def test_ucx_config(cleanup):
+
     ucx = {
         "nvlink": True,
         "infiniband": True,
         "rdmacm": False,
+        "net-devices": "",
         "tcp": True,
-        "cuda-copy": True,
+        "cuda_copy": True,
     }
 
-    with dask.config.set({"distributed.comm.ucx": ucx}):
-        ucx_config, ucx_environment = _prepare_ucx_config()
-        assert ucx_config == {
-            "TLS": "rc,tcp,cuda_copy,cuda_ipc",
-            "SOCKADDR_TLS_PRIORITY": "tcp",
-        }
-        assert ucx_environment == {}
+    with dask.config.set(ucx=ucx):
+        ucx_config = _scrub_ucx_config()
+        assert ucx_config.get("TLS") == "rc,tcp,sockcm,cuda_copy,cuda_ipc"
+        assert ucx_config.get("SOCKADDR_TLS_PRIORITY") == "sockcm"
+        assert ucx_config.get("NET_DEVICES") is None
 
     ucx = {
         "nvlink": False,
         "infiniband": True,
         "rdmacm": False,
+        "net-devices": "mlx5_0:1",
         "tcp": True,
-        "cuda-copy": False,
+        "cuda_copy": False,
     }
 
-    with dask.config.set({"distributed.comm.ucx": ucx}):
-        ucx_config, ucx_environment = _prepare_ucx_config()
-        assert ucx_config == {"TLS": "rc,tcp", "SOCKADDR_TLS_PRIORITY": "tcp"}
-        assert ucx_environment == {}
+    with dask.config.set(ucx=ucx):
+        ucx_config = _scrub_ucx_config()
+        assert ucx_config.get("TLS") == "rc,tcp,sockcm"
+        assert ucx_config.get("SOCKADDR_TLS_PRIORITY") == "sockcm"
+        assert ucx_config.get("NET_DEVICES") == "mlx5_0:1"
 
     ucx = {
         "nvlink": False,
         "infiniband": True,
         "rdmacm": True,
+        "net-devices": "all",
+        "MEMTYPE_CACHE": "y",
         "tcp": True,
-        "cuda-copy": True,
+        "cuda_copy": True,
     }
 
-    with dask.config.set({"distributed.comm.ucx": ucx}):
-        ucx_config, ucx_environment = _prepare_ucx_config()
-        assert ucx_config == {
-            "TLS": "rc,tcp,cuda_copy",
-            "SOCKADDR_TLS_PRIORITY": "rdmacm",
-        }
-        assert ucx_environment == {}
-
-    ucx = {
-        "nvlink": None,
-        "infiniband": None,
-        "rdmacm": None,
-        "tcp": None,
-        "cuda-copy": None,
-    }
-
-    with dask.config.set({"distributed.comm.ucx": ucx}):
-        ucx_config, ucx_environment = _prepare_ucx_config()
-        assert ucx_config == {}
-        assert ucx_environment == {}
-
-    ucx = {
-        "nvlink": False,
-        "infiniband": True,
-        "rdmacm": True,
-        "tcp": True,
-        "cuda-copy": True,
-    }
-
-    with dask.config.set(
-        {
-            "distributed.comm.ucx": ucx,
-            "distributed.comm.ucx.environment": {
-                "tls": "all",
-                "memtrack-dest": "stdout",
-            },
-        }
-    ):
-        ucx_config, ucx_environment = _prepare_ucx_config()
-        assert ucx_config == {
-            "TLS": "rc,tcp,cuda_copy",
-            "SOCKADDR_TLS_PRIORITY": "rdmacm",
-        }
-        assert ucx_environment == {"UCX_MEMTRACK_DEST": "stdout"}
+    with dask.config.set(ucx=ucx):
+        ucx_config = _scrub_ucx_config()
+        assert ucx_config.get("TLS") == "rc,tcp,rdmacm,cuda_copy"
+        assert ucx_config.get("SOCKADDR_TLS_PRIORITY") == "rdmacm"
+        assert ucx_config.get("MEMTYPE_CACHE") == "y"
 
 
-@pytest.mark.flaky(reruns=10, reruns_delay=5)
-def test_ucx_config_w_env_var(ucx_loop, cleanup, loop):
-    env = os.environ.copy()
-    env["DASK_RMM__POOL_SIZE"] = "1000.00 MB"
+def test_ucx_config_w_env_var(cleanup, loop, monkeypatch):
+    size = "1000.00 MB"
+    monkeypatch.setenv("DASK_RMM__POOL_SIZE", size)
+
+    dask.config.refresh()
 
     port = "13339"
-    # Using localhost appears to be less flaky than {HOST}. Additionally, this is
-    # closer to how other dask worker tests are written.
-    sched_addr = f"ucx://127.0.0.1:{port}"
+    sched_addr = "ucx://%s:%s" % (HOST, port)
 
     with popen(
-        ["dask", "scheduler", "--no-dashboard", "--protocol", "ucx", "--port", port],
-        env=env,
-    ):
+        ["dask-scheduler", "--no-dashboard", "--protocol", "ucx", "--port", port]
+    ) as sched:
         with popen(
             [
-                "dask",
-                "worker",
+                "dask-worker",
                 sched_addr,
-                "--host",
-                "127.0.0.1",
                 "--no-dashboard",
                 "--protocol",
                 "ucx",
                 "--no-nanny",
-            ],
-            env=env,
-        ):
-            with Client(sched_addr, loop=loop, timeout=60) as c:
+            ]
+        ) as w:
+            with Client(sched_addr, loop=loop, timeout=10) as c:
                 while not c.scheduler_info()["workers"]:
                     sleep(0.1)
 
-                # Check for RMM pool resource type
-                rmm_resource = c.run_on_scheduler(
-                    rmm.mr.get_current_device_resource_type
-                )
-                assert rmm_resource == rmm.mr.PoolMemoryResource
+                # configured with 1G pool
+                rmm_usage = c.run_on_scheduler(rmm.get_info)
+                assert size == format_bytes(rmm_usage.free)
 
-                rmm_resource_workers = c.run(rmm.mr.get_current_device_resource_type)
-                for v in rmm_resource_workers.values():
-                    assert v == rmm.mr.PoolMemoryResource
+                # configured with 1G pool
+                worker_addr = list(c.scheduler_info()["workers"])[0]
+                worker_rmm_usage = c.run(rmm.get_info)
+                rmm_usage = worker_rmm_usage[worker_addr]
+                assert size == format_bytes(rmm_usage.free)

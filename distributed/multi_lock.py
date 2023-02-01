@@ -1,16 +1,14 @@
-from __future__ import annotations
-
 import asyncio
 import logging
 import uuid
 from collections import defaultdict
-from collections.abc import Hashable
+from typing import Hashable, List
 
 from dask.utils import parse_timedelta
 
-from distributed.client import Client
-from distributed.utils import TimeoutError, log_errors
-from distributed.worker import get_worker
+from .client import Client
+from .utils import TimeoutError, log_errors
+from .worker import get_worker
 
 logger = logging.getLogger(__name__)
 
@@ -46,7 +44,9 @@ class MultiLockExtension:
             {"multi_lock_acquire": self.acquire, "multi_lock_release": self.release}
         )
 
-    def _request_locks(self, locks: list[str], id: Hashable, num_locks: int) -> bool:
+        self.scheduler.extensions["multi_locks"] = self
+
+    def _request_locks(self, locks: List[str], id: Hashable, num_locks: int):
         """Request locks
 
         Parameters
@@ -110,29 +110,31 @@ class MultiLockExtension:
         for waiter in waiters_ready:
             self.scheduler.loop.add_callback(self.events[waiter].set)
 
-    @log_errors
-    async def acquire(self, locks=None, id=None, timeout=None, num_locks=None):
-        if not self._request_locks(locks, id, num_locks):
-            assert id not in self.events
-            event = asyncio.Event()
-            self.events[id] = event
-            future = event.wait()
-            if timeout is not None:
-                future = asyncio.wait_for(future, timeout)
-            try:
-                await future
-            except TimeoutError:
-                self._refain_locks(locks, id)
-                return False
-            finally:
-                del self.events[id]
-        # At this point `id` acquired all `locks`
-        assert self.requests_left[id] == 0
-        return True
+    async def acquire(
+        self, comm=None, locks=None, id=None, timeout=None, num_locks=None
+    ):
+        with log_errors():
+            if not self._request_locks(locks, id, num_locks):
+                assert id not in self.events
+                event = asyncio.Event()
+                self.events[id] = event
+                future = event.wait()
+                if timeout is not None:
+                    future = asyncio.wait_for(future, timeout)
+                try:
+                    await future
+                except TimeoutError:
+                    self._refain_locks(locks, id)
+                    return False
+                finally:
+                    del self.events[id]
+            # At this point `id` acquired all `locks`
+            assert self.requests_left[id] == 0
+            return True
 
-    @log_errors
-    def release(self, id=None):
-        self._refain_locks(self.requests[id], id)
+    def release(self, comm=None, id=None):
+        with log_errors():
+            self._refain_locks(self.requests[id], id)
 
 
 class MultiLock:
@@ -140,10 +142,10 @@ class MultiLock:
 
     Parameters
     ----------
-    names
+    names: List[str]
         Names of the locks to acquire. Choosing the same name allows two
         disconnected processes to coordinate a lock.
-    client
+    client: Client (optional)
         Client to use for communication with the scheduler.  If not given, the
         default global client will be used.
 
@@ -155,14 +157,14 @@ class MultiLock:
     >>> lock.release()  # doctest: +SKIP
     """
 
-    def __init__(self, names: list[str] | None = None, client: Client | None = None):
+    def __init__(self, names=[], client=None):
         try:
             self.client = client or Client.current()
         except ValueError:
             # Initialise new client
             self.client = get_worker().client
 
-        self.names = names or []
+        self.names = names
         self.id = uuid.uuid4().hex
         self._locked = False
 
@@ -223,14 +225,14 @@ class MultiLock:
         self.acquire()
         return self
 
-    def __exit__(self, exc_type, exc_value, traceback):
+    def __exit__(self, *args, **kwargs):
         self.release()
 
     async def __aenter__(self):
         await self.acquire()
         return self
 
-    async def __aexit__(self, exc_type, exc_value, traceback):
+    async def __aexit__(self, *args, **kwargs):
         await self.release()
 
     def __reduce__(self):

@@ -1,8 +1,5 @@
-from __future__ import annotations
-
+from distributed.protocol import serialize, deserialize
 import pytest
-
-from distributed.protocol import deserialize, serialize
 
 np = pytest.importorskip("numpy")
 torch = pytest.importorskip("torch")

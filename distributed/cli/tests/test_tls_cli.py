@@ -1,17 +1,16 @@
-from __future__ import annotations
-
 from time import sleep
 
 from distributed import Client
-from distributed.metrics import time
-from distributed.utils import open_port
 from distributed.utils_test import (
+    popen,
     get_cert,
     new_config_file,
-    popen,
-    tls_only_config,
     tls_security,
+    tls_only_config,
 )
+from distributed.utils_test import loop  # noqa: F401
+from distributed.metrics import time
+
 
 ca_file = get_cert("tls-ca-cert.pem")
 cert = get_cert("tls-cert.pem")
@@ -30,10 +29,10 @@ def wait_for_cores(c, nthreads=1):
         assert time() < start + 10
 
 
-def test_basic(loop, requires_default_ports):
-    with popen(["dask", "scheduler", "--no-dashboard"] + tls_args) as s:
+def test_basic(loop):
+    with popen(["dask-scheduler", "--no-dashboard"] + tls_args) as s:
         with popen(
-            ["dask", "worker", "--no-dashboard", "tls://127.0.0.1:8786"] + tls_args
+            ["dask-worker", "--no-dashboard", "tls://127.0.0.1:8786"] + tls_args
         ) as w:
             with Client(
                 "tls://127.0.0.1:8786", loop=loop, security=tls_security()
@@ -41,87 +40,34 @@ def test_basic(loop, requires_default_ports):
                 wait_for_cores(c)
 
 
-def test_sni(loop):
-    port = open_port()
-    with popen(
-        ["dask", "scheduler", "--no-dashboard", f"--port={port}"] + tls_args
-    ) as s:
-        with popen(
-            [
-                "dask",
-                "worker",
-                "--no-dashboard",
-                "--scheduler-sni",
-                "localhost",
-                f"tls://127.0.0.1:{port}",
-            ]
-            + tls_args
-        ) as w:
-            with Client(
-                f"tls://127.0.0.1:{port}", loop=loop, security=tls_security()
-            ) as c:
-                wait_for_cores(c)
-
-
 def test_nanny(loop):
-    port = open_port()
-    with popen(
-        [
-            "dask",
-            "scheduler",
-            "--no-dashboard",
-            f"--port={port}",
-        ]
-        + tls_args
-    ) as s:
+    with popen(["dask-scheduler", "--no-dashboard"] + tls_args) as s:
         with popen(
-            ["dask", "worker", "--no-dashboard", "--nanny", f"tls://127.0.0.1:{port}"]
+            ["dask-worker", "--no-dashboard", "--nanny", "tls://127.0.0.1:8786"]
             + tls_args
         ) as w:
             with Client(
-                f"tls://127.0.0.1:{port}", loop=loop, security=tls_security()
+                "tls://127.0.0.1:8786", loop=loop, security=tls_security()
             ) as c:
                 wait_for_cores(c)
 
 
 def test_separate_key_cert(loop):
-    port = open_port()
-    with popen(
-        [
-            "dask",
-            "scheduler",
-            "--no-dashboard",
-            f"--port={port}",
-        ]
-        + tls_args_2
-    ) as s:
+    with popen(["dask-scheduler", "--no-dashboard"] + tls_args_2) as s:
         with popen(
-            ["dask", "worker", "--no-dashboard", f"tls://127.0.0.1:{port}"] + tls_args_2
+            ["dask-worker", "--no-dashboard", "tls://127.0.0.1:8786"] + tls_args_2
         ) as w:
             with Client(
-                f"tls://127.0.0.1:{port}", loop=loop, security=tls_security()
+                "tls://127.0.0.1:8786", loop=loop, security=tls_security()
             ) as c:
                 wait_for_cores(c)
 
 
 def test_use_config_file(loop):
-    port = open_port()
     with new_config_file(tls_only_config()):
-        with popen(
-            [
-                "dask",
-                "scheduler",
-                "--no-dashboard",
-                "--host",
-                "tls://",
-                "--port",
-                str(port),
-            ]
-        ) as s:
-            with popen(
-                ["dask", "worker", "--no-dashboard", f"tls://127.0.0.1:{port}"]
-            ) as w:
+        with popen(["dask-scheduler", "--no-dashboard", "--host", "tls://"]) as s:
+            with popen(["dask-worker", "--no-dashboard", "tls://127.0.0.1:8786"]) as w:
                 with Client(
-                    f"tls://127.0.0.1:{port}", loop=loop, security=tls_security()
+                    "tls://127.0.0.1:8786", loop=loop, security=tls_security()
                 ) as c:
                     wait_for_cores(c)

@@ -1,12 +1,8 @@
 *.pyc
 *.pyd
 *.py~
-
-# Cython files
 *.c
 *.so
-distributed/scheduler.html
-
 build/
 dist/
 *.egg-info
@@ -14,12 +10,8 @@ docs/build
 continuous_integration/hdfs-initialized
 .DS_Store
 .cache
-.coverage
-.coverage.*
-coverage.xml
 *.lock
 .#*
-.eggs/
 .idea/
 .vscode/
 .pytest_cache/
@@ -29,13 +21,3 @@ dask-worker-space/
 .ycm_extra_conf.py
 tags
 .ipynb_checkpoints
-.venv/
-.mypy_cache/
-
-reports/
-test_report*.html
-test_report*.db
-test_short_report.html
-
-# Test failures will dump the cluster state in here
-test_cluster_dump/

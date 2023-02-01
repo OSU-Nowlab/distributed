@@ -3,12 +3,10 @@
 Code heavily borrowed from Lib/tests/make_ssl_certs.py in CPython.
 """
 
-from __future__ import annotations
-
 import os
 import shutil
-import subprocess
 import tempfile
+import subprocess
 
 req_template = """
     [req]
@@ -74,7 +72,7 @@ here = os.path.abspath(os.path.dirname(__file__))
 def make_cert_key(hostname, sign=False):
     print("creating cert for " + hostname)
     tempnames = []
-    for _ in range(3):
+    for i in range(3):
         with tempfile.NamedTemporaryFile(delete=False) as f:
             tempnames.append(f.name)
     req_file, cert_file, key_file = tempnames
@@ -122,9 +120,9 @@ def make_cert_key(hostname, sign=False):
             ]
             subprocess.check_call(["openssl"] + args)
 
-        with open(cert_file) as f:
+        with open(cert_file, "r") as f:
             cert = f.read()
-        with open(key_file) as f:
+        with open(key_file, "r") as f:
             key = f.read()
         return cert, key
     finally:
@@ -205,7 +203,7 @@ if __name__ == "__main__":
 
     # For certificate matching tests
     make_ca()
-    with open("tls-ca-cert.pem") as f:
+    with open("tls-ca-cert.pem", "r") as f:
         ca_cert = f.read()
 
     cert, key = make_cert_key("localhost", sign=True)

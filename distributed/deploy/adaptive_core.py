@@ -1,22 +1,12 @@
-from __future__ import annotations
-
+import collections
 import logging
 import math
-from collections import defaultdict, deque
-from collections.abc import Iterable
-from datetime import timedelta
-from typing import TYPE_CHECKING, cast
 
+from tornado.ioloop import IOLoop, PeriodicCallback
 import tlz as toolz
-from tornado.ioloop import IOLoop
 
-from dask.utils import parse_timedelta
-
-from distributed.compatibility import PeriodicCallback
-from distributed.metrics import time
-
-if TYPE_CHECKING:
-    from distributed.scheduler import WorkerState
+from ..metrics import time
+from ..utils import parse_timedelta
 
 
 logger = logging.getLogger(__name__)
@@ -69,7 +59,7 @@ class AdaptiveCore:
     ----------
     minimum: int
         The minimum number of allowed workers
-    maximum: int | inf
+    maximum: int
         The maximum number of allowed workers
     wait_count: int
         The number of scale-down requests we should receive before actually
@@ -78,32 +68,17 @@ class AdaptiveCore:
         The amount of time, like ``"1s"`` between checks
     """
 
-    minimum: int
-    maximum: int | float
-    wait_count: int
-    interval: int | float
-    periodic_callback: PeriodicCallback | None
-    plan: set[WorkerState]
-    requested: set[WorkerState]
-    observed: set[WorkerState]
-    close_counts: defaultdict[WorkerState, int]
-    _adapting: bool
-    log: deque[tuple[float, dict]]
-
     def __init__(
         self,
         minimum: int = 0,
-        maximum: int | float = math.inf,
+        maximum: int = math.inf,
         wait_count: int = 3,
-        interval: str | int | float | timedelta = "1s",
+        interval: str = "1s",
     ):
-        if not isinstance(maximum, int) and not math.isinf(maximum):
-            raise TypeError(f"maximum must be int or inf; got {maximum}")
-
         self.minimum = minimum
         self.maximum = maximum
         self.wait_count = wait_count
-        self.interval = parse_timedelta(interval, "seconds")
+        self.interval = parse_timedelta(interval, "seconds") if interval else interval
         self.periodic_callback = None
 
         def f():
@@ -113,17 +88,11 @@ class AdaptiveCore:
                 pass
 
         if self.interval:
-            import weakref
-
-            self_ref = weakref.ref(self)
-
-            async def _adapt():
-                core = self_ref()
-                if core:
-                    await core.adapt()
-
-            self.periodic_callback = PeriodicCallback(_adapt, self.interval * 1000)
-            self.loop.add_callback(f)
+            self.periodic_callback = PeriodicCallback(self.adapt, self.interval * 1000)
+            try:
+                self.loop.add_callback(f)
+            except AttributeError:
+                IOLoop.current().add_callback(f)
 
         try:
             self.plan = set()
@@ -133,11 +102,11 @@ class AdaptiveCore:
             pass
 
         # internal state
-        self.close_counts = defaultdict(int)
+        self.close_counts = collections.defaultdict(int)
         self._adapting = False
-        self.log = deque(maxlen=10000)
+        self.log = collections.deque(maxlen=10000)
 
-    def stop(self) -> None:
+    def stop(self):
         logger.info("Adaptive stop")
 
         if self.periodic_callback:
@@ -145,7 +114,7 @@ class AdaptiveCore:
             self.periodic_callback = None
 
     async def target(self) -> int:
-        """The target number of workers that should exist"""
+        """ The target number of workers that should exist """
         raise NotImplementedError()
 
     async def workers_to_close(self, target: int) -> list:
@@ -156,21 +125,15 @@ class AdaptiveCore:
         return list(self.observed)[target:]
 
     async def safe_target(self) -> int:
-        """Used internally, like target, but respects minimum/maximum"""
+        """ Used internally, like target, but respects minimum/maximum """
         n = await self.target()
         if n > self.maximum:
-            n = cast(int, self.maximum)
+            n = self.maximum
 
         if n < self.minimum:
             n = self.minimum
 
         return n
-
-    async def scale_down(self, n: int) -> None:
-        raise NotImplementedError()
-
-    async def scale_up(self, workers: Iterable) -> None:
-        raise NotImplementedError()
 
     async def recommendations(self, target: int) -> dict:
         """
@@ -184,34 +147,34 @@ class AdaptiveCore:
             self.close_counts.clear()
             return {"status": "same"}
 
-        if target > len(plan):
+        elif target > len(plan):
             self.close_counts.clear()
             return {"status": "up", "n": target}
 
-        # target < len(plan)
-        not_yet_arrived = requested - observed
-        to_close = set()
-        if not_yet_arrived:
-            to_close.update(toolz.take(len(plan) - target, not_yet_arrived))
+        elif target < len(plan):
+            not_yet_arrived = requested - observed
+            to_close = set()
+            if not_yet_arrived:
+                to_close.update((toolz.take(len(plan) - target, not_yet_arrived)))
 
-        if target < len(plan) - len(to_close):
-            L = await self.workers_to_close(target=target)
-            to_close.update(L)
+            if target < len(plan) - len(to_close):
+                L = await self.workers_to_close(target=target)
+                to_close.update(L)
 
-        firmly_close = set()
-        for w in to_close:
-            self.close_counts[w] += 1
-            if self.close_counts[w] >= self.wait_count:
-                firmly_close.add(w)
+            firmly_close = set()
+            for w in to_close:
+                self.close_counts[w] += 1
+                if self.close_counts[w] >= self.wait_count:
+                    firmly_close.add(w)
 
-        for k in list(self.close_counts):  # clear out unseen keys
-            if k in firmly_close or k not in to_close:
-                del self.close_counts[k]
+            for k in list(self.close_counts):  # clear out unseen keys
+                if k in firmly_close or k not in to_close:
+                    del self.close_counts[k]
 
-        if firmly_close:
-            return {"status": "down", "workers": list(firmly_close)}
-        else:
-            return {"status": "same"}
+            if firmly_close:
+                return {"status": "down", "workers": list(firmly_close)}
+            else:
+                return {"status": "same"}
 
     async def adapt(self) -> None:
         """
@@ -222,7 +185,6 @@ class AdaptiveCore:
         if self._adapting:  # Semaphore to avoid overlapping adapt calls
             return
         self._adapting = True
-        status = None
 
         try:
 
@@ -239,20 +201,8 @@ class AdaptiveCore:
                 await self.scale_up(**recommendations)
             if status == "down":
                 await self.scale_down(**recommendations)
-        except OSError:
-            if status != "down":
-                logger.error("Adaptive stopping due to error", exc_info=True)
-                self.stop()
-            else:
-                logger.error(
-                    "Error during adaptive downscaling. Ignoring.", exc_info=True
-                )
+        except OSError as e:
+            logger.error("Adaptive stopping due to error %s", str(e))
+            self.stop()
         finally:
             self._adapting = False
-
-    def __del__(self):
-        self.stop()
-
-    @property
-    def loop(self) -> IOLoop:
-        return IOLoop.current()

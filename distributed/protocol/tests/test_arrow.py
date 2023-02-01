@@ -1,13 +1,11 @@
-from __future__ import annotations
-
+import pandas as pd
 import pytest
 
 pa = pytest.importorskip("pyarrow")
-pd = pytest.importorskip("pandas")
 
 import distributed
-from distributed.protocol import deserialize, serialize, to_serialize
 from distributed.utils_test import gen_cluster
+from distributed.protocol import deserialize, serialize, to_serialize
 
 df = pd.DataFrame({"A": list("abc"), "B": [1, 2, 3]})
 tbl = pa.Table.from_pandas(df, preserve_index=False)

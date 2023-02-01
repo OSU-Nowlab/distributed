@@ -1,16 +1,10 @@
-from __future__ import annotations
-
-import logging
 from inspect import isawaitable
-
-from tornado.ioloop import IOLoop
-
+import logging
 import dask.config
-from dask.utils import parse_timedelta
 
-from distributed.deploy.adaptive_core import AdaptiveCore
-from distributed.protocol import pickle
-from distributed.utils import log_errors
+from .adaptive_core import AdaptiveCore
+from ..utils import log_errors, parse_timedelta
+from ..protocol import pickle
 
 logger = logging.getLogger(__name__)
 
@@ -76,7 +70,7 @@ class Adaptive(AdaptiveCore):
     :meth:`Adaptive.workers_to_close` to control when the cluster should be
     resized. The default implementation checks if there are too many tasks
     per worker or too little memory available (see
-    :meth:`distributed.Scheduler.adaptive_target`).
+    :meth:`Scheduler.adaptive_target`).
     The values for interval, min, max, wait_count and target_duration can be
     specified in the dask config under the distributed.adaptive key.
     '''
@@ -90,7 +84,7 @@ class Adaptive(AdaptiveCore):
         wait_count=None,
         target_duration=None,
         worker_key=None,
-        **kwargs,
+        **kwargs
     ):
         self.cluster = cluster
         self.worker_key = worker_key
@@ -160,7 +154,7 @@ class Adaptive(AdaptiveCore):
 
         return await super().recommendations(target)
 
-    async def workers_to_close(self, target: int) -> list[str]:
+    async def workers_to_close(self, target: int):
         """
         Determine which, if any, workers should potentially be removed from
         the cluster.
@@ -172,7 +166,7 @@ class Adaptive(AdaptiveCore):
 
         Returns
         -------
-        List of worker names to close, if any
+        List of worker addresses to close, if any
 
         See Also
         --------
@@ -182,36 +176,27 @@ class Adaptive(AdaptiveCore):
             target=target,
             key=pickle.dumps(self.worker_key) if self.worker_key else None,
             attribute="name",
-            **self._workers_to_close_kwargs,
+            **self._workers_to_close_kwargs
         )
 
-    @log_errors
     async def scale_down(self, workers):
         if not workers:
             return
+        with log_errors():
+            # Ask scheduler to cleanly retire workers
+            await self.scheduler.retire_workers(
+                names=workers, remove=True, close_workers=True
+            )
 
-        logger.info("Retiring workers %s", workers)
-        # Ask scheduler to cleanly retire workers
-        await self.scheduler.retire_workers(
-            names=workers,
-            remove=True,
-            close_workers=True,
-        )
-
-        # close workers more forcefully
-        f = self.cluster.scale_down(workers)
-        if isawaitable(f):
-            await f
+            # close workers more forcefully
+            logger.info("Retiring workers %s", workers)
+            f = self.cluster.scale_down(workers)
+            if isawaitable(f):
+                await f
 
     async def scale_up(self, n):
-        f = self.cluster.scale(n)
-        if isawaitable(f):
-            await f
+        self.cluster.scale(n)
 
     @property
-    def loop(self) -> IOLoop:
-        """Override Adaptive.loop"""
-        if self.cluster:
-            return self.cluster.loop
-        else:
-            return IOLoop.current()
+    def loop(self):
+        return self.cluster.loop

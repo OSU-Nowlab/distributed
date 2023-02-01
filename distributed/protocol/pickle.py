@@ -1,13 +1,16 @@
-from __future__ import annotations
-
-import inspect
 import logging
-import pickle
+import sys
 
 import cloudpickle
-from packaging.version import parse as parse_version
 
-CLOUDPICKLE_GTE_20 = parse_version(cloudpickle.__version__) >= parse_version("2.0.0")
+if sys.version_info < (3, 8):
+    try:
+        import pickle5 as pickle
+    except ImportError:
+        import pickle
+else:
+    import pickle
+
 
 HIGHEST_PROTOCOL = pickle.HIGHEST_PROTOCOL
 
@@ -44,14 +47,13 @@ def dumps(x, *, buffer_callback=None, protocol=HIGHEST_PROTOCOL):
     try:
         buffers.clear()
         result = pickle.dumps(x, **dump_kwargs)
-        if b"__main__" in result or (
-            CLOUDPICKLE_GTE_20
-            and getattr(inspect.getmodule(x), "__name__", None)
-            in cloudpickle.list_registry_pickle_by_value()
-        ):
-            if len(result) < 1000 or not _always_use_pickle_for(x):
+        if len(result) < 1000:
+            if b"__main__" in result:
                 buffers.clear()
                 result = cloudpickle.dumps(x, **dump_kwargs)
+        elif not _always_use_pickle_for(x) and b"__main__" in result:
+            buffers.clear()
+            result = cloudpickle.dumps(x, **dump_kwargs)
     except Exception:
         try:
             buffers.clear()
@@ -71,6 +73,6 @@ def loads(x, *, buffers=()):
             return pickle.loads(x, buffers=buffers)
         else:
             return pickle.loads(x)
-    except Exception:
+    except Exception as e:
         logger.info("Failed to deserialize %s", x[:10000], exc_info=True)
         raise

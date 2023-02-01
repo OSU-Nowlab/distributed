@@ -1,5 +1,11 @@
-from __future__ import annotations
+from contextlib import suppress
 
-from distributed.diagnostics.graph_layout import GraphLayout
-from distributed.diagnostics.memory_sampler import MemorySampler
-from distributed.diagnostics.plugin import SchedulerPlugin
+from .graph_layout import GraphLayout
+from .plugin import SchedulerPlugin
+
+with suppress(ImportError):
+    from .progressbar import progress
+with suppress(ImportError):
+    from .resource_monitor import Occupancy
+with suppress(ImportError):
+    from .scheduler_widgets import scheduler_status

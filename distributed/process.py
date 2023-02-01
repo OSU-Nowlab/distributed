@@ -1,23 +1,18 @@
-from __future__ import annotations
-
-import asyncio
-import inspect
 import logging
-import multiprocessing
 import os
+from queue import Queue as PyQueue
 import re
 import threading
 import weakref
-from collections.abc import Callable
-from queue import Queue as PyQueue
-from typing import TypeVar
+import asyncio
+import dask
 
+from .utils import mp_context, TimeoutError
+
+from tornado import gen
 from tornado.concurrent import Future
 from tornado.ioloop import IOLoop
 
-import dask
-
-from distributed.utils import get_mp_context
 
 logger = logging.getLogger(__name__)
 
@@ -50,22 +45,15 @@ class _ProcessState:
     exitcode = None
 
 
-_T_async_process = TypeVar("_T_async_process", bound="AsyncProcess")
-
-
 class AsyncProcess:
     """
     A coroutine-compatible multiprocessing.Process-alike.
     All normally blocking methods are wrapped in Tornado coroutines.
     """
 
-    _process: multiprocessing.Process
-
-    def __init__(self, loop=None, target=None, name=None, args=(), kwargs=None):
-        kwargs = kwargs or {}
-
+    def __init__(self, loop=None, target=None, name=None, args=(), kwargs={}):
         if not callable(target):
-            raise TypeError(f"`target` needs to be callable, not {type(target)!r}")
+            raise TypeError("`target` needs to be callable, not %r" % (type(target),))
         self._state = _ProcessState()
         self._loop = loop or IOLoop.current(instance=False)
 
@@ -78,9 +66,9 @@ class AsyncProcess:
         # monitor from the child and exit when the parent goes away unexpectedly
         # (for example due to SIGKILL). This variable is otherwise unused except
         # for the assignment here.
-        parent_alive_pipe, self._keep_child_alive = get_mp_context().Pipe(duplex=False)
+        parent_alive_pipe, self._keep_child_alive = mp_context.Pipe(duplex=False)
 
-        self._process = get_mp_context().Process(
+        self._process = mp_context.Process(
             target=self._run,
             name=name,
             args=(
@@ -104,7 +92,7 @@ class AsyncProcess:
         self._start_threads()
 
     def __repr__(self):
-        return f"<{self.__class__.__name__} {self._name}>"
+        return "<%s %s>" % (self.__class__.__name__, self._name)
 
     def _check_closed(self):
         if self._closed:
@@ -134,9 +122,9 @@ class AsyncProcess:
         self._thread_finalizer = weakref.finalize(self, stop_thread, q=self._watch_q)
         self._thread_finalizer.atexit = False
 
-    def _on_exit(self, exitcode: int) -> None:
+    def _on_exit(self, exitcode):
         # Called from the event loop when the child process exited
-        self._process = None  # type: ignore[assignment]
+        self._process = None
         if self._exit_callback is not None:
             self._exit_callback(self)
         self._exit_future.set_result(exitcode)
@@ -155,7 +143,7 @@ class AsyncProcess:
                 parent_alive_pipe.recv()
             except EOFError:
                 # Parent process went away unexpectedly. Exit immediately. Could
-                # consider other exiting approaches here. My initial preference
+                # consider other exiting approches here. My initial preference
                 # is to unconditionally and immediately exit. If we're in this
                 # state it is possible that a "clean" process exit won't work
                 # anyway - if, for example, the system is getting bogged down
@@ -173,10 +161,26 @@ class AsyncProcess:
         t.daemon = True
         t.start()
 
+    @staticmethod
+    def reset_logger_locks():
+        """Python 2's logger's locks don't survive a fork event
+
+        https://github.com/dask/distributed/issues/1491
+        """
+        for name in logging.Logger.manager.loggerDict.keys():
+            for handler in logging.getLogger(name).handlers:
+                handler.createLock()
+
     @classmethod
     def _run(
         cls, target, args, kwargs, parent_alive_pipe, _keep_child_alive, inherit_config
     ):
+        # On Python 2 with the fork method, we inherit the _keep_child_alive fd,
+        # whether it is passed or not. Therefore, pass it unconditionally and
+        # close it here, so that there are no other references to the pipe lying
+        # around.
+        cls.reset_logger_locks()
+
         _keep_child_alive.close()
 
         # Child process entry point
@@ -188,9 +192,7 @@ class AsyncProcess:
         target(*args, **kwargs)
 
     @classmethod
-    def _watch_message_queue(  # type: ignore[no-untyped-def]
-        cls, selfref, process: multiprocessing.Process, loop, state, q, exit_future
-    ):
+    def _watch_message_queue(cls, selfref, process, loop, state, q, exit_future):
         # As multiprocessing.Process is not thread-safe, we run all
         # blocking operations from this single loop and ship results
         # back to the caller when needed.
@@ -210,21 +212,16 @@ class AsyncProcess:
 
             state.is_alive = True
             state.pid = process.pid
-            logger.debug(f"[{r}] created process with pid {state.pid!r}")
+            logger.debug("[%s] created process with pid %r" % (r, state.pid))
 
         while True:
             msg = q.get()
-            logger.debug(f"[{r}] got message {msg!r}")
+            logger.debug("[%s] got message %r" % (r, msg))
             op = msg["op"]
             if op == "start":
                 _call_and_set_future(loop, msg["future"], _start)
             elif op == "terminate":
-                # Send SIGTERM
                 _call_and_set_future(loop, msg["future"], process.terminate)
-            elif op == "kill":
-                # Send SIGKILL
-                _call_and_set_future(loop, msg["future"], process.kill)
-
             elif op == "stop":
                 break
             else:
@@ -234,11 +231,9 @@ class AsyncProcess:
     def _watch_process(cls, selfref, process, state, q):
         r = repr(selfref())
         process.join()
-        exitcode = original_exit_code = process.exitcode
-        if exitcode is None:
-            # The child process is already reaped
-            # (may happen if waitpid() is called elsewhere).
-            exitcode = 255
+        exitcode = process.exitcode
+        assert exitcode is not None
+        logger.debug("[%s] process %r exited with code %r", r, state.pid, exitcode)
         state.is_alive = False
         state.exitcode = exitcode
         # Make sure the process is removed from the global list
@@ -251,69 +246,46 @@ class AsyncProcess:
         finally:
             self = None  # lose reference
 
-        # logging may fail - defer calls to after the callback is added
-        if original_exit_code is None:
-            logger.warning(
-                "[%s] process %r exit status was already read will report exitcode 255",
-                r,
-                state.pid,
-            )
-        else:
-            logger.debug("[%s] process %r exited with code %r", r, state.pid, exitcode)
-
     def start(self):
         """
         Start the child process.
 
-        This method returns a future.
+        This method is a coroutine.
         """
         self._check_closed()
         fut = Future()
         self._watch_q.put_nowait({"op": "start", "future": fut})
         return fut
 
-    def terminate(self) -> asyncio.Future[None]:
-        """Terminate the child process.
+    def terminate(self):
+        """
+        Terminate the child process.
 
-        This method returns a future.
-
-        See also
-        --------
-        multiprocessing.Process.terminate
+        This method is a coroutine.
         """
         self._check_closed()
-        fut: Future[None] = Future()
+        fut = Future()
         self._watch_q.put_nowait({"op": "terminate", "future": fut})
         return fut
 
-    def kill(self) -> asyncio.Future[None]:
-        """Send SIGKILL to the child process.
-        On Windows, this is the same as terminate().
-
-        This method returns a future.
-
-        See also
-        --------
-        multiprocessing.Process.kill
-        """
-        self._check_closed()
-        fut: Future[None] = Future()
-        self._watch_q.put_nowait({"op": "kill", "future": fut})
-        return fut
-
-    async def join(self, timeout=None):
+    @gen.coroutine
+    def join(self, timeout=None):
         """
         Wait for the child process to exit.
 
-        This method returns a coroutine.
+        This method is a coroutine.
         """
         self._check_closed()
         assert self._state.pid is not None, "can only join a started process"
         if self._state.exitcode is not None:
             return
-        # Shield otherwise the timeout cancels the future and our
-        # on_exit callback will try to set a result on a canceled future
-        await asyncio.wait_for(asyncio.shield(self._exit_future), timeout)
+        if timeout is None:
+            yield self._exit_future
+        else:
+            try:
+                yield asyncio.wait_for(self._exit_future, timeout)
+            except TimeoutError:
+                pass
 
     def close(self):
         """
@@ -325,19 +297,14 @@ class AsyncProcess:
             self._process = None
             self._closed = True
 
-    def set_exit_callback(
-        self: _T_async_process, func: Callable[[_T_async_process], None]
-    ) -> None:
+    def set_exit_callback(self, func):
         """
         Set a function to be called by the event loop when the process exits.
         The function is called with the AsyncProcess as sole argument.
 
-        The function may not be a coroutine function.
+        The function may be a coroutine function.
         """
         # XXX should this be a property instead?
-        assert not inspect.iscoroutinefunction(
-            func
-        ), "exit callback may not be a coroutine function"
         assert callable(func), "exit callback should be callable"
         assert (
             self._state.pid is None
@@ -371,7 +338,7 @@ class AsyncProcess:
 def _asyncprocess_finalizer(proc):
     if proc.is_alive():
         try:
-            logger.info(f"reaping stray process {proc}")
+            logger.info("reaping stray process %s" % (proc,))
             proc.terminate()
         except OSError:
             pass

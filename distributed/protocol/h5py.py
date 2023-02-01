@@ -1,8 +1,6 @@
-from __future__ import annotations
+from .serialize import dask_serialize, dask_deserialize
 
 import h5py
-
-from distributed.protocol.serialize import dask_deserialize, dask_serialize
 
 
 @dask_serialize.register(h5py.File)

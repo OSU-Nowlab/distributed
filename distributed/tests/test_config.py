@@ -1,63 +1,112 @@
-from __future__ import annotations
-
-import contextlib
 import logging
-import os
 import subprocess
 import sys
 import tempfile
-
-import pytest
+import os
 import yaml
 
-from distributed.config import initialize_logging
-from distributed.utils_test import new_config, new_config_file
+import pytest
 
-
-@pytest.mark.parametrize(
-    "config",
-    [
-        {},
-        None,
-    ],
+from distributed.utils_test import (
+    captured_handler,
+    captured_logger,
+    new_config,
+    new_config_file,
 )
-def test_logging_default(caplog, config):
+from distributed.config import initialize_logging
+
+
+def dump_logger_list():
+    root = logging.getLogger()
+    loggers = root.manager.loggerDict
+    print()
+    print("== Loggers (name, level, effective level, propagate) ==")
+
+    def logger_info(name, logger):
+        return (
+            name,
+            logging.getLevelName(logger.level),
+            logging.getLevelName(logger.getEffectiveLevel()),
+            logger.propagate,
+        )
+
+    infos = []
+    infos.append(logger_info("<root>", root))
+
+    for name, logger in sorted(loggers.items()):
+        if not isinstance(logger, logging.Logger):
+            # Skip 'PlaceHolder' objects
+            continue
+        assert logger.name == name
+        infos.append(logger_info(name, logger))
+
+    for info in infos:
+        print("%-40s %-8s %-8s %-5s" % info)
+
+    print()
+
+
+def test_logging_default():
     """
     Test default logging configuration.
     """
-    if config is None:
-        ctx = contextlib.nullcontext()
-    else:
-        ctx = new_config(config)
-    with ctx:
-        d = logging.getLogger("distributed")
-        assert isinstance(d.handlers[0], logging.StreamHandler)
+    d = logging.getLogger("distributed")
+    assert len(d.handlers) == 1
+    assert isinstance(d.handlers[0], logging.StreamHandler)
 
+    # Work around Bokeh messing with the root logger level
+    # https://github.com/bokeh/bokeh/issues/5793
+    root = logging.getLogger("")
+    old_root_level = root.level
+    root.setLevel("WARN")
+
+    for handler in d.handlers:
+        handler.setLevel("INFO")
+
+    try:
         dfb = logging.getLogger("distributed.foo.bar")
-        dfc = logging.getLogger("distributed.client")
         f = logging.getLogger("foo")
         fb = logging.getLogger("foo.bar")
 
-        d.debug("1: debug")
-        d.info("2: info")
-        dfb.info("3: info")
-        fb.info("4: info")
-        fb.error("5: error")
-        f.info("6: info")
-        f.error("7: error")
-        dfc.info("8: ignore me")
-        dfc.warning("9: important")
+        with captured_handler(d.handlers[0]) as distributed_log:
+            with captured_logger(root, level=logging.ERROR) as foreign_log:
+                h = logging.StreamHandler(foreign_log)
+                fmt = "[%(levelname)s in %(name)s] - %(message)s"
+                h.setFormatter(logging.Formatter(fmt))
+                fb.addHandler(h)
+                fb.propagate = False
 
-        expected_logs = [
-            ("distributed", logging.INFO, "2: info"),
-            ("distributed.foo.bar", logging.INFO, "3: info"),
-            # Info logs of foreign libraries are not logged because default is
-            # WARNING
-            ("foo.bar", logging.ERROR, "5: error"),
-            ("foo", logging.ERROR, "7: error"),
-            ("distributed.client", logging.WARN, "9: important"),
+                # For debugging
+                dump_logger_list()
+
+                d.debug("1: debug")
+                d.info("2: info")
+                dfb.info("3: info")
+                fb.info("4: info")
+                fb.error("5: error")
+                f.info("6: info")
+                f.error("7: error")
+
+        distributed_log = distributed_log.getvalue().splitlines()
+        foreign_log = foreign_log.getvalue().splitlines()
+
+        # distributed log is configured at INFO level by default
+        assert distributed_log == [
+            "distributed - INFO - 2: info",
+            "distributed.foo.bar - INFO - 3: info",
         ]
-        assert expected_logs == caplog.record_tuples
+
+        # foreign logs should be unaffected by distributed's logging
+        # configuration.  They get the default ERROR level from logging.
+        assert foreign_log == ["[ERROR in foo.bar] - 5: error", "7: error"]
+
+    finally:
+        root.setLevel(old_root_level)
+
+
+def test_logging_empty_simple():
+    with new_config({}):
+        test_logging_default()
 
 
 def test_logging_simple_under_distributed():
@@ -90,7 +139,10 @@ def test_logging_simple_under_distributed():
 
             distributed_log = distributed_log.getvalue().splitlines()
 
-            assert len(distributed_log) == 2, (dask.config.config, distributed_log)
+            assert distributed_log == [
+                "distributed.foo - INFO - 1: info",
+                "distributed.foo.bar - ERROR - 3: error",
+                ], (dask.config.config, distributed_log)
             """
 
         subprocess.check_call([sys.executable, "-c", code])
@@ -122,7 +174,10 @@ def test_logging_simple():
 
             distributed_log = distributed_log.getvalue().splitlines()
 
-            assert len(distributed_log) == 2, (dask.config.config, distributed_log)
+            assert distributed_log == [
+                "distributed.foo - INFO - 1: info",
+                "distributed.foo.bar - ERROR - 3: error",
+                ], (dask.config.config, distributed_log)
             """
 
         subprocess.check_call([sys.executable, "-c", code])
@@ -148,11 +203,11 @@ def test_logging_extended():
             "loggers": {
                 "distributed.foo": {
                     "level": "INFO",
-                    # 'handlers': ['console'],
+                    #'handlers': ['console'],
                 },
                 "distributed.foo.bar": {
                     "level": "ERROR",
-                    # 'handlers': ['console'],
+                    #'handlers': ['console'],
                 },
             },
             "root": {"level": "WARNING", "handlers": ["console"]},
@@ -276,15 +331,9 @@ def test_schema_is_complete():
     with open(schema_fn) as f:
         schema = yaml.safe_load(f)
 
-    skip = {
-        "distributed.scheduler.default-task-durations",
-        "distributed.scheduler.dashboard.bokeh-application",
-        "distributed.nanny.environ",
-        "distributed.nanny.pre-spawn-environ",
-        "distributed.comm.ucx.environment",
-    }
+    skip = {"default-task-durations", "bokeh-application"}
 
-    def test_matches(c, s, root):
+    def test_matches(c, s):
         if set(c) != set(s["properties"]):
             raise ValueError(
                 "\nThe distributed.yaml and distributed-schema.yaml files are not in sync.\n"
@@ -299,21 +348,7 @@ def test_schema_is_complete():
                 )
             )
         for k, v in c.items():
-            key = f"{root}.{k}" if root else k
-            if isinstance(v, dict) and key not in skip:
-                test_matches(c[k], s["properties"][k], key)
+            if isinstance(v, dict) and k not in skip:
+                test_matches(c[k], s["properties"][k])
 
-    test_matches(config, schema, "")
-
-
-def test_uvloop_event_loop():
-    """Check that configuring distributed to use uvloop actually sets the event loop policy"""
-    pytest.importorskip("uvloop")
-    script = (
-        "import distributed, asyncio, uvloop\n"
-        "assert isinstance(asyncio.get_event_loop_policy(), uvloop.EventLoopPolicy)"
-    )
-    subprocess.check_call(
-        [sys.executable, "-c", script],
-        env={"DASK_DISTRIBUTED__ADMIN__EVENT_LOOP": "uvloop"},
-    )
+    test_matches(config, schema)

@@ -1,23 +1,21 @@
-from __future__ import annotations
-
+from abc import ABC, abstractmethod, abstractproperty
 import asyncio
+from contextlib import suppress
 import inspect
 import logging
 import random
 import sys
 import weakref
-from abc import ABC, abstractmethod
-from contextlib import suppress
-from typing import Any, ClassVar
 
 import dask
-from dask.utils import parse_timedelta
 
-from distributed.comm import registry
-from distributed.comm.addressing import parse_address
-from distributed.metrics import time
-from distributed.protocol.compression import get_default_compression
-from distributed.protocol.pickle import HIGHEST_PROTOCOL
+from ..metrics import time
+from ..utils import parse_timedelta, TimeoutError
+from . import registry
+from .addressing import parse_address
+from ..protocol.compression import get_default_compression
+from ..protocol import pickle
+
 
 logger = logging.getLogger(__name__)
 
@@ -42,60 +40,54 @@ class Comm(ABC):
     depending on the underlying transport's characteristics.
     """
 
-    _instances: ClassVar[weakref.WeakSet[Comm]] = weakref.WeakSet()
-    name: str | None
-    local_info: dict
-    remote_info: dict
-    handshake_options: dict
-    deserialize: bool
+    _instances = weakref.WeakSet()
 
-    def __init__(self, deserialize: bool = True):
+    def __init__(self):
         self._instances.add(self)
         self.allow_offload = True  # for deserialization in utils.from_frames
         self.name = None
         self.local_info = {}
         self.remote_info = {}
         self.handshake_options = {}
-        self.deserialize = deserialize
 
     # XXX add set_close_callback()?
 
     @abstractmethod
-    async def read(self, deserializers=None):
+    def read(self, deserializers=None):
         """
         Read and return a message (a Python object).
 
-        This method returns a coroutine.
+        This method is a coroutine.
 
         Parameters
         ----------
-        deserializers : dict[str, tuple[Callable, Callable, bool]] | None
+        deserializers : Optional[Dict[str, Tuple[Callable, Callable, bool]]]
             An optional dict appropriate for distributed.protocol.deserialize.
             See :ref:`serialization` for more.
         """
 
     @abstractmethod
-    async def write(self, msg, serializers=None, on_error=None):
+    def write(self, msg, serializers=None, on_error=None):
         """
         Write a message (a Python object).
 
-        This method returns a coroutine.
+        This method is a coroutine.
 
         Parameters
         ----------
-        msg
-        on_error : str | None
+        msg :
+        on_error : Optional[str]
             The behavior when serialization fails. See
             ``distributed.protocol.core.dumps`` for valid values.
         """
 
     @abstractmethod
-    async def close(self):
+    def close(self):
         """
         Close the communication cleanly.  This will attempt to flush
         outgoing buffers before actually closing the underlying transport.
 
-        This method returns a coroutine.
+        This method is a coroutine.
         """
 
     @abstractmethod
@@ -107,17 +99,21 @@ class Comm(ABC):
 
     @abstractmethod
     def closed(self):
-        """Return whether the stream is closed."""
+        """
+        Return whether the stream is closed.
+        """
 
-    @property
-    @abstractmethod
-    def local_address(self) -> str:
-        """The local address. For logging and debugging purposes only."""
+    @abstractproperty
+    def local_address(self):
+        """
+        The local address.  For logging and debugging purposes only.
+        """
 
-    @property
-    @abstractmethod
-    def peer_address(self) -> str:
-        """The peer's address. For logging and debugging purposes only."""
+    @abstractproperty
+    def peer_address(self):
+        """
+        The peer's address.  For logging and debugging purposes only.
+        """
 
     @property
     def extra_info(self):
@@ -133,7 +129,7 @@ class Comm(ABC):
         return {
             "compression": get_default_compression(),
             "python": tuple(sys.version_info)[:3],
-            "pickle-protocol": HIGHEST_PROTOCOL,
+            "pickle-protocol": pickle.HIGHEST_PROTOCOL,
         }
 
     @staticmethod
@@ -159,13 +155,16 @@ class Comm(ABC):
         return out
 
     def __repr__(self):
-        return "<{}{} {} local={} remote={}>".format(
-            self.__class__.__name__,
-            " (closed)" if self.closed() else "",
-            self.name or "",
-            self.local_address,
-            self.peer_address,
-        )
+        clsname = self.__class__.__name__
+        if self.closed():
+            return "<closed %s>" % (clsname,)
+        else:
+            return "<%s %s local=%s remote=%s>" % (
+                clsname,
+                self.name or "",
+                self.local_address,
+                self.peer_address,
+            )
 
 
 class Listener(ABC):
@@ -182,15 +181,13 @@ class Listener(ABC):
         communications, but prevents accepting new ones.
         """
 
-    @property
-    @abstractmethod
+    @abstractproperty
     def listen_address(self):
         """
         The listening address as a URI string.
         """
 
-    @property
-    @abstractmethod
+    @abstractproperty
     def contact_address(self):
         """
         An address this listener can be contacted on.  This can be
@@ -202,7 +199,7 @@ class Listener(ABC):
         await self.start()
         return self
 
-    async def __aexit__(self, exc_type, exc_value, traceback):
+    async def __aexit__(self, *exc):
         future = self.stop()
         if inspect.isawaitable(future):
             await future
@@ -214,9 +211,7 @@ class Listener(ABC):
 
         return _().__await__()
 
-    async def on_connection(
-        self, comm: Comm, handshake_overrides: dict[str, Any] | None = None
-    ) -> None:
+    async def on_connection(self, comm: Comm, handshake_overrides=None):
         local_info = {**comm.handshake_info(), **(handshake_overrides or {})}
 
         timeout = dask.config.get("distributed.comm.timeouts.connect")
@@ -225,19 +220,19 @@ class Listener(ABC):
             # Timeout is to ensure that we'll terminate connections eventually.
             # Connector side will employ smaller timeouts and we should only
             # reach this if the comm is dead anyhow.
-            await asyncio.wait_for(comm.write(local_info), timeout=timeout)
+            write = await asyncio.wait_for(comm.write(local_info), timeout=timeout)
             handshake = await asyncio.wait_for(comm.read(), timeout=timeout)
             # This would be better, but connections leak if worker is closed quickly
             # write, handshake = await asyncio.gather(comm.write(local_info), comm.read())
         except Exception as e:
             with suppress(Exception):
                 await comm.close()
-            raise CommClosedError(f"Comm {comm!r} closed.") from e
+            raise CommClosedError() from e
 
         comm.remote_info = handshake
-        comm.remote_info["address"] = comm.peer_address
+        comm.remote_info["address"] = comm._peer_addr
         comm.local_info = local_info
-        comm.local_info["address"] = comm.local_address
+        comm.local_info["address"] = comm._local_addr
 
         comm.handshake_options = comm.handshake_configuration(
             comm.local_info, comm.remote_info
@@ -246,10 +241,10 @@ class Listener(ABC):
 
 class Connector(ABC):
     @abstractmethod
-    async def connect(self, address, deserialize=True):
+    def connect(self, address, deserialize=True):
         """
         Connect to the given address and return a Comm object.
-        This function returns a coroutine. It may raise EnvironmentError
+        This function is a coroutine.   It may raise EnvironmentError
         if the other endpoint is unreachable or unavailable.  It
         may raise ValueError if the address is malformed.
         """
@@ -280,7 +275,7 @@ async def connect(
 
     backoff_base = 0.01
     attempt = 0
-    logger.debug("Establishing connection to %s", loc)
+
     # Prefer multiple small attempts than one long attempt. This should protect
     # primarily from DNS race conditions
     # gh3104, gh4176, gh4167
@@ -295,26 +290,22 @@ async def connect(
             break
         except FatalCommClosedError:
             raise
-        # Note: CommClosed inherits from OSError
-        except (asyncio.TimeoutError, OSError) as exc:
+        # CommClosed, EnvironmentError inherit from OSError
+        except (TimeoutError, OSError) as exc:
             active_exception = exc
 
-            # As described above, the intermediate timeout is used to distributed
-            # initial, bulk connect attempts homogeneously. In particular with
-            # the jitter upon retries we should not be worred about overloading
-            # any more DNS servers
-            intermediate_cap = timeout
+            # The intermediate capping is mostly relevant for the initial
+            # connect. Afterwards we should be more forgiving
+            intermediate_cap = intermediate_cap * 1.5
             # FullJitter see https://aws.amazon.com/blogs/architecture/exponential-backoff-and-jitter/
 
-            upper_cap = min(time_left(), backoff_base * (2**attempt))
+            upper_cap = min(time_left(), backoff_base * (2 ** attempt))
             backoff = random.uniform(0, upper_cap)
             attempt += 1
-            logger.debug(
-                "Could not connect to %s, waiting for %s before retrying", loc, backoff
-            )
+            logger.debug("Could not connect, waiting for %s before retrying", backoff)
             await asyncio.sleep(backoff)
     else:
-        raise OSError(
+        raise IOError(
             f"Timed out trying to connect to {addr} after {timeout} s"
         ) from active_exception
 
@@ -330,7 +321,7 @@ async def connect(
     except Exception as exc:
         with suppress(Exception):
             await comm.close()
-        raise OSError(
+        raise IOError(
             f"Timed out during handshake while connecting to {addr} after {timeout} s"
         ) from exc
 

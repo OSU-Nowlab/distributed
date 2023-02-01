@@ -1,9 +1,8 @@
-from __future__ import annotations
-
 import pytest
 
-pytestmark = pytest.mark.gpu
-from distributed.protocol import deserialize, serialize
+from distributed.protocol import serialize, deserialize
+from dask.dataframe.utils import assert_eq
+import pandas as pd
 
 
 @pytest.mark.parametrize("collection", [tuple, dict])
@@ -38,15 +37,14 @@ def test_serialize_cupy(collection, y, y_serializer):
 @pytest.mark.parametrize("collection", [tuple, dict])
 @pytest.mark.parametrize(
     "df2,df2_serializer",
-    [({"C": [3, 4, 5], "D": [2.5, 3.5, 4.5]}, "cuda"), (None, "pickle")],
+    [(pd.DataFrame({"C": [3, 4, 5], "D": [2.5, 3.5, 4.5]}), "cuda"), (None, "pickle")],
 )
 def test_serialize_pandas_pandas(collection, df2, df2_serializer):
     cudf = pytest.importorskip("cudf")
-    pd = pytest.importorskip("pandas")
-    dd = pytest.importorskip("dask.dataframe")
+
     df1 = cudf.DataFrame({"A": [1, 2, None], "B": [1.0, 2.0, None]})
     if df2 is not None:
-        df2 = cudf.from_pandas(pd.DataFrame(df2))
+        df2 = cudf.from_pandas(df2)
     if issubclass(collection, dict):
         header, frames = serialize(
             {"df1": df1, "df2": df2}, serializers=("cuda", "dask", "pickle")
@@ -61,8 +59,8 @@ def test_serialize_pandas_pandas(collection, df2, df2_serializer):
     assert sub_headers[1]["serializer"] == df2_serializer
     assert isinstance(t, collection)
 
-    dd.assert_eq(t["df1"] if isinstance(t, dict) else t[0], df1)
+    assert_eq(t["df1"] if isinstance(t, dict) else t[0], df1)
     if df2 is None:
         assert (t["df2"] if isinstance(t, dict) else t[1]) is None
     else:
-        dd.assert_eq(t["df2"] if isinstance(t, dict) else t[1], df2)
+        assert_eq(t["df2"] if isinstance(t, dict) else t[1], df2)

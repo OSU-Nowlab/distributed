@@ -1,8 +1,4 @@
-from __future__ import annotations
-
-import uuid
-
-from distributed.diagnostics.plugin import SchedulerPlugin
+from .plugin import SchedulerPlugin
 
 
 class GraphLayout(SchedulerPlugin):
@@ -11,12 +7,11 @@ class GraphLayout(SchedulerPlugin):
     This assigns (x, y) locations to all tasks quickly and dynamically as new
     tasks are added.  This scales to a few thousand nodes.
 
-    It is commonly used with distributed/dashboard/components/scheduler.py::TaskGraph, which
+    It is commonly used with distributed/bokeh/scheduler.py::TaskGraph, which
     is rendered at /graph on the diagnostic dashboard.
     """
 
     def __init__(self, scheduler):
-        self.name = f"graph-layout-{uuid.uuid4()}"
         self.x = {}
         self.y = {}
         self.collision = {}
@@ -31,6 +26,8 @@ class GraphLayout(SchedulerPlugin):
         self.state_updates = []
         self.visible_updates = []
         self.visible_edge_updates = []
+
+        scheduler.add_plugin(self)
 
         if self.scheduler.tasks:
             dependencies = {
@@ -102,7 +99,9 @@ class GraphLayout(SchedulerPlugin):
             task = self.scheduler.tasks[key]
             for dep in task.dependents:
                 edge = (key, dep.key)
-                self.visible_edge_updates.append((self.index_edge.pop(edge), "False"))
+                self.visible_edge_updates.append(
+                    (self.index_edge.pop((key, dep.key)), "False")
+                )
             for dep in task.dependencies:
                 self.visible_edge_updates.append(
                     (self.index_edge.pop((dep.key, key)), "False")

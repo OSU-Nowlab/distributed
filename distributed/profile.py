@@ -24,31 +24,20 @@ We represent this tree as a nested dictionary with the following form:
                    'children': {...}}}
     }
 """
-from __future__ import annotations
-
 import bisect
-import dis
+from collections import defaultdict, deque
 import linecache
 import sys
 import threading
-from collections import defaultdict, deque
-from collections.abc import Callable, Collection
 from time import sleep
-from types import FrameType
-from typing import Any
 
 import tlz as toolz
 
-from dask.utils import format_time, parse_timedelta
-
-from distributed.metrics import time
-from distributed.utils import color_of
-
-#: This lock can be acquired to ensure that no instance of watch() is concurrently holding references to frames
-lock = threading.Lock()
+from .metrics import time
+from .utils import format_time, color_of, parse_timedelta
 
 
-def identifier(frame: FrameType | None) -> str:
+def identifier(frame):
     """A string identifier from a frame
 
     Strings are cheaper to use as indexes into dicts than tuples or dicts
@@ -65,110 +54,55 @@ def identifier(frame: FrameType | None) -> str:
         )
 
 
-def _f_lineno(frame: FrameType) -> int:
-    """Work around some frames lacking an f_lineno
-    See: https://bugs.python.org/issue47085
-    """
-    f_lineno = frame.f_lineno
-    if f_lineno is not None:
-        return f_lineno
-
-    f_lasti = frame.f_lasti
-    code = frame.f_code
-    prev_line = code.co_firstlineno
-
-    for start, next_line in dis.findlinestarts(code):
-        if f_lasti < start:
-            return prev_line
-        prev_line = next_line
-
-    return prev_line
-
-
-def repr_frame(frame: FrameType) -> str:
-    """Render a frame as a line for inclusion into a text traceback"""
+def repr_frame(frame):
+    """ Render a frame as a line for inclusion into a text traceback """
     co = frame.f_code
-    f_lineno = _f_lineno(frame)
-    text = f'  File "{co.co_filename}", line {f_lineno}, in {co.co_name}'
-    line = linecache.getline(co.co_filename, f_lineno, frame.f_globals).lstrip()
+    text = '  File "%s", line %s, in %s' % (co.co_filename, frame.f_lineno, co.co_name)
+    line = linecache.getline(co.co_filename, frame.f_lineno, frame.f_globals).lstrip()
     return text + "\n\t" + line
 
 
-def info_frame(frame: FrameType) -> dict[str, Any]:
+def info_frame(frame):
     co = frame.f_code
-    f_lineno = _f_lineno(frame)
-    line = linecache.getline(co.co_filename, f_lineno, frame.f_globals).lstrip()
+    line = linecache.getline(co.co_filename, frame.f_lineno, frame.f_globals).lstrip()
     return {
         "filename": co.co_filename,
         "name": co.co_name,
-        "line_number": f_lineno,
+        "line_number": frame.f_lineno,
         "line": line,
     }
 
 
-def process(
-    frame: FrameType,
-    child: object | None,
-    state: dict[str, Any],
-    *,
-    stop: str | None = None,
-    omit: Collection[str] = (),
-    depth: int | None = None,
-) -> dict[str, Any] | None:
+def process(frame, child, state, stop=None, omit=None):
     """Add counts from a frame stack onto existing state
 
     This recursively adds counts to the existing state dictionary and creates
     new entries for new functions.
-
-    Parameters
-    ----------
-    frame:
-        The frame to process onto the state
-    child:
-        For internal use only
-    state:
-        The profile state to accumulate this frame onto, see ``create``
-    stop:
-        Filename suffix that should stop processing if we encounter it
-    omit:
-        Filenames that we should omit from processing
-    depth:
-        For internal use only, how deep we are in the call stack
-        Used to prevent stack overflow
 
     Examples
     --------
     >>> import sys, threading
     >>> ident = threading.get_ident()  # replace with your thread of interest
     >>> frame = sys._current_frames()[ident]
-    >>> state = create()
+    >>> state = {'children': {}, 'count': 0, 'description': 'root',
+    ...          'identifier': 'root'}
     >>> process(frame, None, state)
     >>> state
     {'count': 1,
      'identifier': 'root',
      'description': 'root',
      'children': {'...'}}
-
-    See also
-    --------
-    create
-    merge
     """
-    if depth is None:
-        depth = sys.getrecursionlimit() - 50
-    if depth <= 0:
-        return None
-    if any(frame.f_code.co_filename.endswith(o) for o in omit):
-        return None
+    if omit is not None and any(frame.f_code.co_filename.endswith(o) for o in omit):
+        return False
 
     prev = frame.f_back
     if prev is not None and (
         stop is None or not prev.f_code.co_filename.endswith(stop)
     ):
-        new_state = process(prev, frame, state, stop=stop, depth=depth - 1)
-        if new_state is None:
-            return None
-        state = new_state
+        state = process(prev, frame, state, stop=stop)
+        if state is False:
+            return False
 
     ident = identifier(frame)
 
@@ -189,35 +123,31 @@ def process(
         return d
     else:
         d["count"] += 1
-        return None
 
 
-def merge(*args: dict[str, Any]) -> dict[str, Any]:
-    """Merge multiple frame states together"""
+def merge(*args):
+    """ Merge multiple frame states together """
     if not args:
         return create()
     s = {arg["identifier"] for arg in args}
-    if len(s) != 1:  # pragma: no cover
-        raise ValueError(f"Expected identifiers, got {s}")
+    if len(s) != 1:
+        raise ValueError("Expected identifiers, got %s" % str(s))
     children = defaultdict(list)
     for arg in args:
         for child in arg["children"]:
             children[child].append(arg["children"][child])
 
-    try:
-        children_dict = {k: merge(*v) for k, v in children.items()}
-    except RecursionError:  # pragma: no cover
-        children_dict = {}
+    children = {k: merge(*v) for k, v in children.items()}
     count = sum(arg["count"] for arg in args)
     return {
         "description": args[0]["description"],
-        "children": children_dict,
+        "children": dict(children),
         "count": count,
         "identifier": args[0]["identifier"],
     }
 
 
-def create() -> dict[str, Any]:
+def create():
     return {
         "count": 0,
         "children": {},
@@ -226,7 +156,7 @@ def create() -> dict[str, Any]:
     }
 
 
-def call_stack(frame: FrameType) -> list[str]:
+def call_stack(frame):
     """Create a call text stack from a frame
 
     Returns
@@ -234,10 +164,9 @@ def call_stack(frame: FrameType) -> list[str]:
     list of strings
     """
     L = []
-    cur_frame: FrameType | None = frame
-    while cur_frame:
-        L.append(repr_frame(cur_frame))
-        cur_frame = cur_frame.f_back
+    while frame:
+        L.append(repr_frame(frame))
+        frame = frame.f_back
     return L[::-1]
 
 
@@ -279,12 +208,14 @@ def plot_data(state, profile_interval=0.010):
         line_numbers.append(desc["line_number"])
         names.append(desc["name"])
 
+        ident = state["identifier"]
+
         try:
             fn = desc["filename"]
-        except IndexError:  # pragma: no cover
+        except IndexError:
             colors.append("gray")
         else:
-            if fn == "<low-level>":  # pragma: no cover
+            if fn == "<low-level>":
                 colors.append("lightgray")
             else:
                 colors.append(color_of(fn))
@@ -293,13 +224,13 @@ def plot_data(state, profile_interval=0.010):
 
         x = start
 
-        for _, child in state["children"].items():
+        for name, child in state["children"].items():
             width = child["count"] * delta
             traverse(child, x, x + width, height + 1)
             x += width
 
     traverse(state, 0, 1, 0)
-    percentages = [f"{100 * w:.1f}%" for w in widths]
+    percentages = ["{:.1f}%".format(100 * w) for w in widths]
     return {
         "left": starts,
         "right": stops,
@@ -317,42 +248,35 @@ def plot_data(state, profile_interval=0.010):
     }
 
 
-def _watch(
-    thread_id: int,
-    log: deque[tuple[float, dict[str, Any]]],  # [(timestamp, output of create()), ...]
-    interval: float,
-    cycle: float,
-    omit: Collection[str],
-    stop: Callable[[], bool],
-) -> None:
+def _watch(thread_id, log, interval="20ms", cycle="2s", omit=None, stop=lambda: False):
+    interval = parse_timedelta(interval)
+    cycle = parse_timedelta(cycle)
 
     recent = create()
     last = time()
 
     while not stop():
         if time() > last + cycle:
+            log.append((time(), recent))
             recent = create()
-            with lock:
-                log.append((time(), recent))
-                last = time()
-                try:
-                    frame = sys._current_frames()[thread_id]
-                except KeyError:
-                    return
+            last = time()
+        try:
+            frame = sys._current_frames()[thread_id]
+        except KeyError:
+            return
 
-                process(frame, None, recent, omit=omit)
-                del frame
+        process(frame, None, recent, omit=omit)
         sleep(interval)
 
 
 def watch(
-    thread_id: int | None = None,
-    interval: str = "20ms",
-    cycle: str = "2s",
-    maxlen: int = 1000,
-    omit: Collection[str] = (),
-    stop: Callable[[], bool] = lambda: False,
-) -> deque[tuple[float, dict[str, Any]]]:
+    thread_id=None,
+    interval="20ms",
+    cycle="2s",
+    maxlen=1000,
+    omit=None,
+    stop=lambda: False,
+):
     """Gather profile information on a particular thread
 
     This starts a new thread to watch a particular thread and returns a deque
@@ -360,37 +284,34 @@ def watch(
 
     Parameters
     ----------
-    thread_id : int, optional
-        Defaults to current thread
-    interval : str
+    thread_id: int
+    interval: str
         Time per sample
-    cycle : str
+    cycle: str
         Time per refreshing to a new profile state
-    maxlen : int
+    maxlen: int
         Passed onto deque, maximum number of periods
-    omit : collection of str
-        Don't include entries whose filename includes any of these substrings
-    stop : callable
-        Function to call to see if we should stop. It must
-        accept no arguments and return a bool (True to stop,
-        False to continue).
+    omit: str
+        Don't include entries that start with this filename
+    stop: callable
+        Function to call to see if we should stop
 
     Returns
     -------
-    deque of tuples:
-
-    - timestamp
-    - dict[str, Any] (output of ``create()``)
+    deque
     """
-    log: deque[tuple[float, dict[str, Any]]] = deque(maxlen=maxlen)
+    if thread_id is None:
+        thread_id = threading.get_ident()
+
+    log = deque(maxlen=maxlen)
 
     thread = threading.Thread(
         target=_watch,
         name="Profile",
         kwargs={
-            "thread_id": thread_id or threading.get_ident(),
-            "interval": parse_timedelta(interval),
-            "cycle": parse_timedelta(cycle),
+            "thread_id": thread_id,
+            "interval": interval,
+            "cycle": cycle,
             "log": log,
             "omit": omit,
             "stop": stop,
@@ -407,13 +328,14 @@ def get_profile(history, recent=None, start=None, stop=None, key=None):
 
     Parameters
     ----------
-    history : Sequence[Tuple[time, Dict]]
+    history: Sequence[Tuple[time, Dict]]
         A list or deque of profile states
-    recent : dict
+    recent: dict
         The most recent accumulating state
-    start : time
-    stop : time
+    start: time
+    stop: time
     """
+    now = time()
     if start is None:
         istart = 0
     else:
@@ -453,8 +375,8 @@ def plot_figure(data, **kwargs):
     --------
     plot_data
     """
-    from bokeh.models import HoverTool
     from bokeh.plotting import ColumnDataSource, figure
+    from bokeh.models import HoverTool
 
     if "states" in data:
         data = toolz.dissoc(data, "states")
@@ -521,15 +443,11 @@ def _remove_py_stack(frames):
         yield entry
 
 
-def llprocess(  # type: ignore[no-untyped-def]
-    frames,
-    child: object | None,
-    state: dict[str, Any] | None,
-) -> dict[str, Any] | None:
+def llprocess(frames, child, state):
     """Add counts from low level profile information onto existing state
 
     This uses the ``stacktrace`` module to collect low level stack trace
-    information and place it onto the given state.
+    information and place it onto the given sttate.
 
     It is configured with the ``distributed.worker.profile.low-level`` config
     entry.
@@ -540,11 +458,10 @@ def llprocess(  # type: ignore[no-untyped-def]
     ll_get_stack
     """
     if not frames:
-        return None
+        return
     frame = frames.pop()
     if frames:
         state = llprocess(frames, frame, state)
-    assert state
 
     addr = hex(frame.addr - frame.offset)
     ident = ";".join(map(str, (frame.name, "<low-level>", addr)))
@@ -570,11 +487,10 @@ def llprocess(  # type: ignore[no-untyped-def]
         return d
     else:
         d["count"] += 1
-        return None
 
 
 def ll_get_stack(tid):
-    """Collect low level stack information from thread id"""
+    """ Collect low level stack information from thread id """
     from stacktrace import get_thread_stack
 
     frames = get_thread_stack(tid, show_python=False)

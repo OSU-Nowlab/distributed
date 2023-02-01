@@ -1,12 +1,10 @@
-from __future__ import annotations
-
 import numba
 import numba.cuda
 import numpy
 import rmm
 
-from distributed.protocol.cuda import cuda_deserialize, cuda_serialize
-from distributed.protocol.serialize import dask_deserialize, dask_serialize
+from .cuda import cuda_deserialize, cuda_serialize
+from .serialize import dask_deserialize, dask_serialize
 
 # Used for RMM 0.11.0+ otherwise Numba serializers used
 if hasattr(rmm, "DeviceBuffer"):
@@ -15,6 +13,7 @@ if hasattr(rmm, "DeviceBuffer"):
     def cuda_serialize_rmm_device_buffer(x):
         header = x.__cuda_array_interface__.copy()
         header["strides"] = (1,)
+        header["lengths"] = [x.nbytes]
         frames = [x]
         return header, frames
 
@@ -32,6 +31,7 @@ if hasattr(rmm, "DeviceBuffer"):
     @dask_serialize.register(rmm.DeviceBuffer)
     def dask_serialize_rmm_device_buffer(x):
         header, frames = cuda_serialize_rmm_device_buffer(x)
+        header["writeable"] = (None,) * len(frames)
         frames = [numba.cuda.as_cuda_array(f).copy_to_host().data for f in frames]
         return header, frames
 

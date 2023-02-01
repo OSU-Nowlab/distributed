@@ -7,13 +7,46 @@ API
 
 **Client**
 
-The client connects to and submits computation to a Dask cluster (such as a :class:`distributed.LocalCluster`)
-
 .. autosummary::
    Client
-
-.. autoautosummary:: distributed.Client
-   :methods:
+   Client.call_stack
+   Client.cancel
+   Client.close
+   Client.compute
+   Client.gather
+   Client.get
+   Client.get_dataset
+   Client.get_events
+   Client.get_executor
+   Client.get_metadata
+   Client.get_scheduler_logs
+   Client.get_worker_logs
+   Client.get_task_stream
+   Client.has_what
+   Client.list_datasets
+   Client.log_event
+   Client.map
+   Client.nthreads
+   Client.persist
+   Client.publish_dataset
+   Client.profile
+   Client.rebalance
+   Client.replicate
+   Client.restart
+   Client.retry
+   Client.run
+   Client.run_on_scheduler
+   Client.scatter
+   Client.scheduler_info
+   Client.write_scheduler_file
+   Client.set_metadata
+   Client.start_ipython_workers
+   Client.start_ipython_scheduler
+   Client.submit
+   Client.unpublish_dataset
+   Client.upload_file
+   Client.wait_for_workers
+   Client.who_has
 
 .. currentmodule:: distributed
 
@@ -23,15 +56,13 @@ The client connects to and submits computation to a Dask cluster (such as a :cla
    get_client
    secede
    rejoin
-   print
-   warn
    Reschedule
 
-.. currentmodule:: distributed.recreate_tasks
+.. currentmodule:: distributed.recreate_exceptions
 
 .. autosummary::
-   ReplayTaskClient.recreate_task_locally
-   ReplayTaskClient.recreate_error_locally
+   ReplayExceptionClient.get_futures_error
+   ReplayExceptionClient.recreate_error_locally
 
 .. currentmodule:: distributed
 
@@ -40,19 +71,22 @@ The client connects to and submits computation to a Dask cluster (such as a :cla
 
 .. autosummary::
    Future
+   Future.add_done_callback
+   Future.cancel
+   Future.cancelled
+   Future.done
+   Future.exception
+   Future.result
+   Future.retry
+   Future.traceback
 
-.. autoautosummary:: distributed.Future
-   :methods:
-
-**Synchronization**
+**Client Coordination**
 
 .. currentmodule:: distributed
 
 .. autosummary::
    Event
    Lock
-   MultiLock
-   Semaphore
    Queue
    Variable
 
@@ -61,20 +95,12 @@ The client connects to and submits computation to a Dask cluster (such as a :cla
 
 .. autosummary::
    as_completed
-   distributed.diagnostics.progressbar.progress
+   distributed.diagnostics.progress
    wait
    fire_and_forget
    futures_of
    get_task_stream
    get_task_metadata
-   performance_report
-
-
-**Utilities**
-
-.. autosummary::
-   distributed.utils.Log
-   distributed.utils.Logs
 
 
 Asynchronous methods
@@ -117,7 +143,7 @@ Client
 .. autoclass:: Client
    :members:
 
-.. autoclass:: distributed.recreate_tasks.ReplayTaskClient
+.. autoclass:: distributed.recreate_exceptions.ReplayExceptionClient
    :members:
 
 
@@ -126,24 +152,6 @@ Future
 
 .. autoclass:: Future
    :members:
-
-
-Synchronization
----------------
-
-.. autoclass:: Event
-   :members:
-.. autoclass:: Lock
-   :members:
-.. autoclass:: MultiLock
-   :members:
-.. autoclass:: Semaphore
-   :members:
-.. autoclass:: Queue
-   :members:
-.. autoclass:: Variable
-   :members:
-
 
 Cluster
 -------
@@ -174,7 +182,7 @@ Other
 .. autoclass:: as_completed
    :members:
 
-.. autofunction:: distributed.diagnostics.progressbar.progress
+.. autofunction:: distributed.diagnostics.progress
 .. autofunction:: wait
 .. autofunction:: fire_and_forget
 .. autofunction:: futures_of
@@ -186,19 +194,20 @@ Other
 .. autofunction:: distributed.get_client
 .. autofunction:: distributed.secede
 .. autofunction:: distributed.rejoin
-.. autofunction:: distributed.print
-.. autofunction:: distributed.warn
 .. autoclass:: distributed.Reschedule
 .. autoclass:: get_task_stream
 .. autoclass:: get_task_metadata
-.. autoclass:: performance_report
 
-
-Utilities
----------
-
-.. autoclass:: distributed.utils.Log
-.. autoclass:: distributed.utils.Logs
+.. autoclass:: Event
+   :members:
+.. autoclass:: Lock
+   :members:
+.. autoclass:: Semaphore
+   :members:
+.. autoclass:: Queue
+   :members:
+.. autoclass:: Variable
+   :members:
 
 
 Adaptive

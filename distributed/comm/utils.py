@@ -1,5 +1,3 @@
-from __future__ import annotations
-
 import logging
 import math
 import socket
@@ -8,8 +6,9 @@ import dask
 from dask.sizeof import sizeof
 from dask.utils import parse_bytes
 
-from distributed import protocol
-from distributed.utils import get_ip, get_ipv6, nbytes, offload
+from .. import protocol
+from ..utils import get_ip, get_ipv6, nbytes, offload
+
 
 logger = logging.getLogger(__name__)
 
@@ -20,39 +19,20 @@ if isinstance(OFFLOAD_THRESHOLD, str):
     OFFLOAD_THRESHOLD = parse_bytes(OFFLOAD_THRESHOLD)
 
 
-# Find the function, `host_array()`, to use when allocating new host arrays
-try:
-    # Use NumPy, when available, to avoid memory initialization cost.
-    # A `bytearray` is zero-initialized using `calloc`, which we don't need.
-    # `np.empty` both skips the zero-initialization, and
-    # uses hugepages when available ( https://github.com/numpy/numpy/pull/14216 ).
-    import numpy
-
-    def numpy_host_array(n: int) -> memoryview:
-        return numpy.empty((n,), dtype="u1").data
-
-    host_array = numpy_host_array
-except ImportError:
-
-    def builtin_host_array(n: int) -> memoryview:
-        return memoryview(bytearray(n))
-
-    host_array = builtin_host_array
-
-
 async def to_frames(
-    msg,
-    allow_offload=True,
-    **kwargs,
+    msg, serializers=None, on_error="message", context=None, allow_offload=True
 ):
     """
     Serialize a message into a list of Distributed protocol frames.
-    Any kwargs are forwarded to protocol.dumps().
     """
 
     def _to_frames():
         try:
-            return list(protocol.dumps(msg, **kwargs))
+            return list(
+                protocol.dumps(
+                    msg, serializers=serializers, on_error=on_error, context=context
+                )
+            )
         except Exception as e:
             logger.info("Unserializable Message: %s", msg)
             logger.exception(e)
@@ -69,6 +49,7 @@ async def to_frames(
     if allow_offload and OFFLOAD_THRESHOLD and msg_size > OFFLOAD_THRESHOLD:
         return await offload(_to_frames)
     else:
+        #print("calling _to_frames() ") 
         return _to_frames()
 
 
@@ -102,47 +83,39 @@ async def from_frames(frames, deserialize=True, deserializers=None, allow_offloa
     return res
 
 
-def get_tcp_server_addresses(tcp_server):
+def get_tcp_server_address(tcp_server):
     """
-    Get all bound addresses of a started Tornado TCPServer.
+    Get the bound address of a started Tornado TCPServer.
     """
     sockets = list(tcp_server._sockets.values())
     if not sockets:
-        raise RuntimeError(f"TCP Server {tcp_server!r} not started yet?")
+        raise RuntimeError("TCP Server %r not started yet?" % (tcp_server,))
 
     def _look_for_family(fam):
-        socks = []
         for sock in sockets:
             if sock.family == fam:
-                socks.append(sock)
-        return socks
+                return sock
+        return None
 
     # If listening on both IPv4 and IPv6, prefer IPv4 as defective IPv6
     # is common (e.g. Travis-CI).
-    socks = _look_for_family(socket.AF_INET)
-    if not socks:
-        socks = _look_for_family(socket.AF_INET6)
-    if not socks:
+    sock = _look_for_family(socket.AF_INET)
+    if sock is None:
+        sock = _look_for_family(socket.AF_INET6)
+    if sock is None:
         raise RuntimeError("No Internet socket found on TCPServer??")
 
-    return [sock.getsockname() for sock in socks]
+    return sock.getsockname()
 
 
-def get_tcp_server_address(tcp_server):
-    """
-    Get the first bound address of a started Tornado TCPServer.
-    """
-    return get_tcp_server_addresses(tcp_server)[0]
-
-
-def ensure_concrete_host(host, default_host=None):
+def ensure_concrete_host(host):
     """
     Ensure the given host string (or IP) denotes a concrete host, not a
     wildcard listening address.
     """
     if host in ("0.0.0.0", ""):
-        return default_host or get_ip()
+        return get_ip()
     elif host == "::":
-        return default_host or get_ipv6()
+        return get_ipv6()
     else:
         return host

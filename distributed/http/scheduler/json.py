@@ -1,7 +1,5 @@
-from __future__ import annotations
-
-from distributed.http.utils import RequestHandler
-from distributed.utils import log_errors
+from ..utils import RequestHandler
+from ...utils import log_errors
 
 
 class CountsJSON(RequestHandler):
@@ -59,15 +57,15 @@ class IdentityJSON(RequestHandler):
 
 
 class IndexJSON(RequestHandler):
-    @log_errors
     def get(self):
-        r = [url[5:] for url, _, _ in routes if url.endswith(".json")]
-        self.render(
-            "json-index.html", routes=r, title="Index of JSON routes", **self.extra
-        )
+        with log_errors():
+            r = [url[5:] for url, _, _ in routes if url.endswith(".json")]
+            self.render(
+                "json-index.html", routes=r, title="Index of JSON routes", **self.extra
+            )
 
 
-routes: list[tuple] = [
+routes = [
     (r"json/counts.json", CountsJSON, {}),
     (r"json/identity.json", IdentityJSON, {}),
     (r"json/index.html", IndexJSON, {}),

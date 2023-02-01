@@ -1,26 +1,15 @@
-from __future__ import annotations
-
-import logging
-import sys
-import warnings
-from textwrap import dedent
-
+from distributed.deploy.old_ssh import SSHCluster
 import click
 
-from distributed.deploy.old_ssh import SSHCluster
-
-logger = logging.getLogger("distributed.dask_ssh")
+from distributed.cli.utils import check_python_3
 
 
 @click.command(
-    name="ssh",
-    help=dedent(
-        """Launch a Dask cluster over SSH. A 'dask scheduler' process will run on the
-        first host specified in [HOSTNAMES] or in the hostfile, unless --scheduler is specified
-        explicitly. One or more 'dask worker' processes will be run on each host. Use the flag
-        --nworkers to adjust how many dask worker process are run on each host and the flag
-        --nthreads to adjust how many CPUs are used by each dask worker process."""
-    ),
+    help="""Launch a distributed cluster over SSH. A 'dask-scheduler' process will run on the
+                         first host specified in [HOSTNAMES] or in the hostfile (unless --scheduler is specified
+                         explicitly). One or more 'dask-worker' processes will be run each host in [HOSTNAMES] or
+                         in the hostfile. Use command line flags to adjust how many dask-worker process are run on
+                         each host (--nprocs) and how many cpus are used by each dask-worker process (--nthreads)."""
 )
 @click.option(
     "--scheduler",
@@ -46,8 +35,7 @@ logger = logging.getLogger("distributed.dask_ssh")
     ),
 )
 @click.option(
-    "--nworkers",
-    "n_workers",  # This sets the Python argument name
+    "--nprocs",
     default=1,
     show_default=True,
     type=int,
@@ -86,7 +74,7 @@ logger = logging.getLogger("distributed.dask_ssh")
     type=click.Path(exists=True),
     help=(
         "Directory to use on all cluster nodes for the output of "
-        "dask scheduler and dask worker commands."
+        "dask-scheduler and dask-worker commands."
     ),
 )
 @click.option(
@@ -133,7 +121,7 @@ def main(
     hostnames,
     hostfile,
     nthreads,
-    n_workers,
+    nprocs,
     ssh_username,
     ssh_port,
     ssh_private_key,
@@ -146,12 +134,6 @@ def main(
     remote_dask_worker,
     local_directory,
 ):
-    if "dask-ssh" in sys.argv[0]:
-        warnings.warn(
-            "dask-ssh is deprecated and will be removed in a future release; use `dask ssh` instead",
-            FutureWarning,
-        )
-
     try:
         hostnames = list(hostnames)
         if hostfile:
@@ -171,7 +153,7 @@ def main(
         scheduler_port,
         hostnames,
         nthreads,
-        n_workers,
+        nprocs,
         ssh_username,
         ssh_port,
         ssh_private_key,
@@ -193,20 +175,25 @@ def main(
             version=distributed.__version__
         )
     )
-    print(f"Worker nodes: {len(hostnames)}")
+    print("Worker nodes: {n}".format(n=len(hostnames)))
     for i, host in enumerate(hostnames):
-        print(f"  {i}: {host}")
-    print(f"\nscheduler node: {scheduler}:{scheduler_port}")
+        print("  {num}: {host}".format(num=i, host=host))
+    print("\nscheduler node: {addr}:{port}".format(addr=scheduler, port=scheduler_port))
     print("---------------------------------------------------------------\n\n")
 
     # Monitor the output of remote processes.  This blocks until the user issues a KeyboardInterrupt.
     c.monitor_remote_processes()
 
     # Close down the remote processes and exit.
-    print("\n[ dask ssh ]: Shutting down remote processes (this may take a moment).")
+    print("\n[ dask-ssh ]: Shutting down remote processes (this may take a moment).")
     c.shutdown()
-    print("[ dask ssh ]: Remote processes have been terminated. Exiting.")
+    print("[ dask-ssh ]: Remote processes have been terminated. Exiting.")
+
+
+def go():
+    check_python_3()
+    main()
 
 
 if __name__ == "__main__":
-    main()  # pragma: no cover
+    go()

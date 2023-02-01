@@ -1,21 +1,16 @@
 """
 Efficient serialization of SciPy sparse matrices.
 """
-from __future__ import annotations
-
 import scipy
 
-from distributed.protocol.serialize import (
-    dask_deserialize,
-    dask_serialize,
-    register_generic,
-)
+from .serialize import dask_deserialize, dask_serialize, register_generic
 
 register_generic(scipy.sparse.spmatrix, "dask", dask_serialize, dask_deserialize)
 
 
 @dask_serialize.register(scipy.sparse.dok.dok_matrix)
 def serialize_scipy_sparse_dok(x):
+    x_coo = x.tocoo()
     coo_header, coo_frames = dask_serialize(x.tocoo())
 
     header = {"coo_header": coo_header}

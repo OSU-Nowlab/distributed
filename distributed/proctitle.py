@@ -1,5 +1,3 @@
-from __future__ import annotations
-
 import os
 
 try:
@@ -38,7 +36,7 @@ def setproctitle(title):
     if not enabled:
         try:
             enabled = int(os.environ.get("DASK_PARENT", "")) != os.getpid()
-        except ValueError:  # pragma: no cover
+        except ValueError:
             pass
     if enabled:
         setproctitle_mod.setproctitle(title)

@@ -1,12 +1,6 @@
-from __future__ import annotations
-
+from distributed.protocol import serialize, deserialize
 import pickle
-
 import pytest
-
-pytestmark = pytest.mark.gpu
-
-from distributed.protocol import deserialize, serialize
 
 cuda = pytest.importorskip("numba.cuda")
 np = pytest.importorskip("numpy")
@@ -31,8 +25,10 @@ def test_serialize_numba(shape, dtype, order, serializers):
     elif serializers[0] == "dask":
         assert all(isinstance(f, memoryview) for f in frames)
 
-    hx = x.copy_to_host()
-    hy = y.copy_to_host()
+    hx = np.empty_like(ary)
+    hy = np.empty_like(ary)
+    x.copy_to_host(hx)
+    y.copy_to_host(hy)
     assert (hx == hy).all()
 
 

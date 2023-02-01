@@ -1,18 +1,13 @@
-from __future__ import annotations
-
-import contextlib
-import logging
 from collections import deque
-from typing import Any
+import logging
 
+import dask
 from tornado import gen, locks
 from tornado.ioloop import IOLoop
 
-import dask
-from dask.utils import parse_timedelta
+from .core import CommClosedError
+from .utils import parse_timedelta
 
-from distributed.core import CommClosedError
-from distributed.metrics import time
 
 logger = logging.getLogger(__name__)
 
@@ -29,7 +24,7 @@ class BatchedSend:
 
     Examples
     --------
-    >>> stream = await connect(address)
+    >>> stream = yield connect(address)
     >>> bstream = BatchedSend(interval='10 ms')
     >>> bstream.start(stream)
     >>> bstream.send('Hello,')
@@ -88,38 +83,23 @@ class BatchedSend:
                 # Nothing to send
                 self.next_deadline = None
                 continue
-            if self.next_deadline is not None and time() < self.next_deadline:
+            if self.next_deadline is not None and self.loop.time() < self.next_deadline:
                 # Send interval not expired yet
                 continue
             payload, self.buffer = self.buffer, []
             self.batch_count += 1
-            self.next_deadline = time() + self.interval
+            self.next_deadline = self.loop.time() + self.interval
             try:
-                # NOTE: Since `BatchedSend` doesn't have a handle on the running
-                # `_background_send` coroutine, the only thing with a reference to this
-                # coroutine is the event loop itself. If the event loop stops while
-                # we're waiting on a `write`, the `_background_send` coroutine object
-                # may be garbage collected. If that happens, the `yield coro` will raise
-                # `GeneratorExit`. But because this is an old-school `gen.coroutine`,
-                # and we're using `yield` and not `await`, the `write` coroutine object
-                # will not actually have been awaited, and it will remain sitting around
-                # for someone to retrieve it. At interpreter exit, this will warn
-                # sommething like `RuntimeWarning: coroutine 'TCP.write' was never
-                # awaited`. By using the `closing` contextmanager, the `write` coroutine
-                # object is always cleaned up, even if `yield` raises `GeneratorExit`.
-                with contextlib.closing(
-                    self.comm.write(
-                        payload, serializers=self.serializers, on_error="raise"
-                    )
-                ) as coro:
-                    nbytes = yield coro
+                nbytes = yield self.comm.write(
+                    payload, serializers=self.serializers, on_error="raise"
+                )
                 if nbytes < 1e6:
                     self.recent_message_log.append(payload)
                 else:
                     self.recent_message_log.append("large-message")
                 self.byte_count += nbytes
-            except CommClosedError:
-                logger.info("Batched Comm Closed %r", self.comm, exc_info=True)
+            except CommClosedError as e:
+                logger.info("Batched Comm Closed: %s", e)
                 break
             except Exception:
                 # We cannot safely retry self.comm.write, as we have no idea
@@ -147,16 +127,16 @@ class BatchedSend:
         self.stopped.set()
         self.abort()
 
-    def send(self, *msgs: Any) -> None:
+    def send(self, msg):
         """Schedule a message for sending to the other side
 
         This completes quickly and synchronously
         """
         if self.comm is not None and self.comm.closed():
-            raise CommClosedError(f"Comm {self.comm!r} already closed.")
+            raise CommClosedError
 
-        self.message_count += len(msgs)
-        self.buffer.extend(msgs)
+        self.message_count += 1
+        self.buffer.append(msg)
         # Avoid spurious wakeups if possible
         if self.next_deadline is None:
             self.waker.set()
@@ -176,13 +156,9 @@ class BatchedSend:
             try:
                 if self.buffer:
                     self.buffer, payload = [], self.buffer
-                    # See note in `_background_send` for explanation of `closing`.
-                    with contextlib.closing(
-                        self.comm.write(
-                            payload, serializers=self.serializers, on_error="raise"
-                        )
-                    ) as coro:
-                        yield coro
+                    yield self.comm.write(
+                        payload, serializers=self.serializers, on_error="raise"
+                    )
             except CommClosedError:
                 pass
             yield self.comm.close()

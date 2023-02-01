@@ -1,18 +1,16 @@
-from __future__ import annotations
-
+import errno
 import glob
 import logging
 import os
 import shutil
 import stat
-import sys
 import tempfile
 import weakref
-from typing import ClassVar
-
-import locket
 
 import dask
+
+from . import locket
+
 
 logger = logging.getLogger(__name__)
 
@@ -26,21 +24,16 @@ def is_locking_enabled():
 def safe_unlink(path):
     try:
         os.unlink(path)
-    except FileNotFoundError:
+    except EnvironmentError as e:
         # Perhaps it was removed by someone else?
-        pass
-    except OSError as e:
-        logger.error(f"Failed to remove {path}: {e}")
+        if e.errno != errno.ENOENT:
+            logger.error("Failed to remove %r", str(e))
 
 
 class WorkDir:
     """
     A temporary work directory inside a WorkSpace.
     """
-
-    dir_path: str
-    _lock_path: str
-    _finalizer: weakref.finalize
 
     def __init__(self, workspace, name=None, prefix=None):
         assert name is None or prefix is None
@@ -62,7 +55,7 @@ class WorkDir:
                     with workspace._global_lock():
                         self._lock_file = locket.lock_file(self._lock_path)
                         self._lock_file.acquire()
-                except OSError:
+                except OSError as e:
                     logger.exception(
                         "Could not acquire workspace lock on "
                         "path: %s ."
@@ -116,46 +109,22 @@ class WorkSpace:
     this will be detected and the directories purged.
     """
 
-    base_dir: str
-    _global_lock_path: str
-    _purge_lock_path: str
-
     # Keep track of all locks known to this process, to avoid several
     # WorkSpaces to step on each other's toes
-    _known_locks: ClassVar[set[str]] = set()
+    _known_locks = set()
 
-    def __init__(self, base_dir: str):
-        self.base_dir = self._init_workspace(base_dir)
+    def __init__(self, base_dir):
+        self.base_dir = os.path.abspath(base_dir)
+        self._init_workspace()
         self._global_lock_path = os.path.join(self.base_dir, "global.lock")
         self._purge_lock_path = os.path.join(self.base_dir, "purge.lock")
 
-    def _init_workspace(self, base_dir: str) -> str:
-        """Create base_dir if it doesn't exist.
-        If base_dir already exists but it's not writeable, change the name.
-        """
-        base_dir = os.path.abspath(base_dir)
-        try_dirs = [base_dir]
-        # Note: WINDOWS constant doesn't work with `mypy --platform win32`
-        if sys.platform != "win32":
-            # - os.getlogin() raises OSError on containerized environments
-            # - os.getuid() does not exist in Windows
-            try_dirs.append(f"{base_dir}-{os.getuid()}")
-
-        for try_dir in try_dirs:
-            try:
-                os.makedirs(try_dir)
-            except FileExistsError:
-                try:
-                    with tempfile.TemporaryFile(dir=try_dir):
-                        pass
-                except PermissionError:
-                    continue
-            return try_dir
-
-        # If we reached this, we're likely in a containerized environment where /tmp
-        # has been shared between containers through a mountpoint, every container
-        # has an external $UID, but the internal one is the same for all.
-        return tempfile.mkdtemp(prefix=base_dir + "-")
+    def _init_workspace(self):
+        try:
+            os.mkdir(self.base_dir)
+        except EnvironmentError as e:
+            if e.errno != errno.EEXIST:
+                raise
 
     def _global_lock(self, **kwargs):
         return locket.lock_file(self._global_lock_path, **kwargs)
@@ -206,7 +175,7 @@ class WorkSpace:
         for p in glob.glob(os.path.join(self.base_dir, "*" + DIR_LOCK_EXT)):
             try:
                 st = os.stat(p)
-            except OSError:
+            except EnvironmentError:
                 # May have been removed in the meantime
                 pass
             else:
@@ -259,9 +228,9 @@ class WorkSpace:
 
         Parameters
         ----------
-        prefix : str (optional)
+        prefix: str (optional)
             The prefix of the temporary subdirectory name for the workdir
-        name : str (optional)
+        name: str (optional)
             The subdirectory name for the workdir
         """
         try:

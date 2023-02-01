@@ -1,42 +1,40 @@
-from __future__ import annotations
-
 import asyncio
 import weakref
 
-import tlz as toolz
-from bokeh.core.properties import without_property_validation
-from bokeh.layouts import column, row
+from bokeh.layouts import row, column
 from bokeh.models import (
-    Button,
     ColumnDataSource,
     DataRange1d,
     HoverTool,
-    LabelSet,
-    NumeralTickFormatter,
     Range1d,
+    Button,
     Select,
-    Title,
+    NumeralTickFormatter,
 )
 from bokeh.palettes import Spectral9
 from bokeh.plotting import figure
-from tornado import gen
-
 import dask
+from tornado import gen
+import tlz as toolz
 
-from distributed import profile
-from distributed.compatibility import WINDOWS
 from distributed.dashboard.components import DashboardComponent
-from distributed.dashboard.utils import update
-from distributed.utils import log_errors
+from distributed.dashboard.utils import (
+    without_property_validation,
+    BOKEH_VERSION,
+    update,
+)
+from distributed import profile
+from distributed.utils import log_errors, parse_timedelta
+from distributed.compatibility import WINDOWS
 
 if dask.config.get("distributed.dashboard.export-tool"):
     from distributed.dashboard.export_tool import ExportTool
 else:
-    ExportTool = None  # type: ignore
+    ExportTool = None
 
 
 profile_interval = dask.config.get("distributed.worker.profile.interval")
-profile_interval = dask.utils.parse_timedelta(profile_interval, default="ms")
+profile_interval = parse_timedelta(profile_interval, default="ms")
 
 
 class Processing(DashboardComponent):
@@ -55,7 +53,8 @@ class Processing(DashboardComponent):
             title="Processing and Pending",
             tools="",
             x_range=x_range,
-            **kwargs,
+            id="bk-processing-stacks-plot",
+            **kwargs
         )
         fig.quad(
             source=self.source,
@@ -88,44 +87,44 @@ class Processing(DashboardComponent):
         self.root = fig
 
     @without_property_validation
-    @log_errors
     def update(self, messages):
-        msg = messages["processing"]
-        if not msg.get("nthreads"):
-            return
-        data = self.processing_update(msg)
-        x_range = self.root.x_range
-        max_right = max(data["right"])
-        cores = max(data["nthreads"])
-        if x_range.end < max_right:
-            x_range.end = max_right + 2
-        elif x_range.end > 2 * max_right + cores:  # way out there, walk back
-            x_range.end = x_range.end * 0.95 + max_right * 0.05
+        with log_errors():
+            msg = messages["processing"]
+            if not msg.get("nthreads"):
+                return
+            data = self.processing_update(msg)
+            x_range = self.root.x_range
+            max_right = max(data["right"])
+            cores = max(data["nthreads"])
+            if x_range.end < max_right:
+                x_range.end = max_right + 2
+            elif x_range.end > 2 * max_right + cores:  # way out there, walk back
+                x_range.end = x_range.end * 0.95 + max_right * 0.05
 
-        update(self.source, data)
+            update(self.source, data)
 
     @staticmethod
-    @log_errors
     def processing_update(msg):
-        names = sorted(msg["processing"])
-        names = sorted(names)
-        processing = msg["processing"]
-        processing = [processing[name] for name in names]
-        nthreads = msg["nthreads"]
-        nthreads = [nthreads[name] for name in names]
-        n = len(names)
-        d = {
-            "name": list(names),
-            "processing": processing,
-            "right": list(processing),
-            "top": list(range(n, 0, -1)),
-            "bottom": list(range(n - 1, -1, -1)),
-            "nthreads": nthreads,
-        }
+        with log_errors():
+            names = sorted(msg["processing"])
+            names = sorted(names)
+            processing = msg["processing"]
+            processing = [processing[name] for name in names]
+            nthreads = msg["nthreads"]
+            nthreads = [nthreads[name] for name in names]
+            n = len(names)
+            d = {
+                "name": list(names),
+                "processing": processing,
+                "right": list(processing),
+                "top": list(range(n, 0, -1)),
+                "bottom": list(range(n - 1, -1, -1)),
+                "nthreads": nthreads,
+            }
 
-        d["alpha"] = [0.7] * n
+            d["alpha"] = [0.7] * n
 
-        return d
+            return d
 
 
 class ProfilePlot(DashboardComponent):
@@ -141,27 +140,34 @@ class ProfilePlot(DashboardComponent):
         self.root, self.source = profile.plot_figure(data, **kwargs)
 
         @without_property_validation
-        @log_errors
         def cb(attr, old, new):
-            try:
-                ind = new.indices[0]
-            except IndexError:
-                return
-            data = profile.plot_data(self.states[ind], profile_interval)
-            del self.states[:]
-            self.states.extend(data.pop("states"))
-            update(self.source, data)
-            self.source.selected = old
+            with log_errors():
+                try:
+                    selected = new.indices
+                except AttributeError:
+                    selected = new["1d"]["indices"]
+                try:
+                    ind = selected[0]
+                except IndexError:
+                    return
+                data = profile.plot_data(self.states[ind], profile_interval)
+                del self.states[:]
+                self.states.extend(data.pop("states"))
+                update(self.source, data)
+                self.source.selected = old
 
-        self.source.selected.on_change("indices", cb)
+        if BOKEH_VERSION >= "1.0.0":
+            self.source.selected.on_change("indices", cb)
+        else:
+            self.source.on_change("selected", cb)
 
     @without_property_validation
-    @log_errors
     def update(self, state):
-        self.state = state
-        data = profile.plot_data(self.state, profile_interval)
-        self.states = data.pop("states")
-        update(self.source, data)
+        with log_errors():
+            self.state = state
+            data = profile.plot_data(self.state, profile_interval)
+            self.states = data.pop("states")
+            update(self.source, data)
 
 
 class ProfileTimePlot(DashboardComponent):
@@ -181,7 +187,7 @@ class ProfileTimePlot(DashboardComponent):
                 self.key = self.key[0]
             if isinstance(self.key, bytes):
                 self.key = self.key.decode()
-            self.task_names = ["All", self.key] if self.key else ["All"]
+            self.task_names = ["All", self.key]
         else:
             self.key = None
             self.task_names = ["All"]
@@ -194,22 +200,37 @@ class ProfileTimePlot(DashboardComponent):
         data = profile.plot_data(self.state, profile_interval)
         self.states = data.pop("states")
         self.profile_plot, self.source = profile.plot_figure(data, **kwargs)
+
         changing = [False]  # avoid repeated changes from within callback
 
         @without_property_validation
         def cb(attr, old, new):
-            if changing[0] or len(new) == 0:
+            if changing[0]:
                 return
             with log_errors():
-                data = profile.plot_data(self.states[new[0]], profile_interval)
+                if isinstance(new, list):  # bokeh >= 1.0
+                    selected = new
+                else:
+                    selected = new["1d"]["indices"]
+                try:
+                    ind = selected[0]
+                except IndexError:
+                    return
+                data = profile.plot_data(self.states[ind], profile_interval)
                 del self.states[:]
                 self.states.extend(data.pop("states"))
                 changing[0] = True  # don't recursively trigger callback
                 update(self.source, data)
-                self.source.selected.indices = old
+                if isinstance(new, list):  # bokeh >= 1.0
+                    self.source.selected.indices = old
+                else:
+                    self.source.selected = old
                 changing[0] = False
 
-        self.source.selected.on_change("indices", cb)
+        if BOKEH_VERSION >= "1.0.0":
+            self.source.selected.on_change("indices", cb)
+        else:
+            self.source.on_change("selected", cb)
 
         self.ts_source = ColumnDataSource({"time": [], "count": []})
         self.ts_plot = figure(
@@ -228,18 +249,24 @@ class ProfileTimePlot(DashboardComponent):
         self.ts_plot.yaxis.visible = False
         self.ts_plot.grid.visible = False
 
-        @log_errors
         def ts_change(attr, old, new):
-            selected = self.ts_source.selected.indices
-            if selected:
-                start = self.ts_source.data["time"][min(selected)] / 1000
-                stop = self.ts_source.data["time"][max(selected)] / 1000
-                self.start, self.stop = min(start, stop), max(start, stop)
-            else:
-                self.start = self.stop = None
-            self.trigger_update(update_metadata=False)
+            with log_errors():
+                try:
+                    selected = self.ts_source.selected.indices
+                except AttributeError:
+                    selected = self.ts_source.selected["1d"]["indices"]
+                if selected:
+                    start = self.ts_source.data["time"][min(selected)] / 1000
+                    stop = self.ts_source.data["time"][max(selected)] / 1000
+                    self.start, self.stop = min(start, stop), max(start, stop)
+                else:
+                    self.start = self.stop = None
+                self.trigger_update(update_metadata=False)
 
-        self.ts_source.selected.on_change("indices", ts_change)
+        if BOKEH_VERSION >= "1.0.0":
+            self.ts_source.selected.on_change("indices", ts_change)
+        else:
+            self.ts_source.on_change("selected", ts_change)
 
         self.reset_button = Button(label="Reset", button_type="success")
         self.reset_button.on_click(lambda: self.update(self.state))
@@ -267,51 +294,43 @@ class ProfileTimePlot(DashboardComponent):
             ),
             self.profile_plot,
             self.ts_plot,
-            **kwargs,
+            **kwargs
         )
 
-        self.subtitle = Title(text=" ", text_font_style="italic")
-        self.profile_plot.add_layout(self.subtitle, "above")
-        if not dask.config.get("distributed.worker.profile.enabled"):
-            self.subtitle.text = "Profiling is disabled."
-            self.select.disabled = True
-            self.reset_button.disabled = True
-            self.update_button.disabled = True
-
     @without_property_validation
-    @log_errors
     def update(self, state, metadata=None):
-        self.state = state
-        data = profile.plot_data(self.state, profile_interval)
-        self.states = data.pop("states")
-        update(self.source, data)
+        with log_errors():
+            self.state = state
+            data = profile.plot_data(self.state, profile_interval)
+            self.states = data.pop("states")
+            update(self.source, data)
 
-        if metadata is not None and metadata["counts"]:
-            self.task_names = ["All"] + sorted(metadata["keys"])
-            self.select.options = self.task_names
-            if self.key and self.key in metadata["keys"]:
-                ts = metadata["keys"][self.key]
-            else:
-                ts = metadata["counts"]
-            times, counts = zip(*ts)
-            self.ts = {"count": counts, "time": [t * 1000 for t in times]}
+            if metadata is not None and metadata["counts"]:
+                self.task_names = ["All"] + sorted(metadata["keys"])
+                self.select.options = self.task_names
+                if self.key:
+                    ts = metadata["keys"][self.key]
+                else:
+                    ts = metadata["counts"]
+                times, counts = zip(*ts)
+                self.ts = {"count": counts, "time": [t * 1000 for t in times]}
 
-            self.ts_source.data.update(self.ts)
+                self.ts_source.data.update(self.ts)
 
     @without_property_validation
     def trigger_update(self, update_metadata=True):
-        @log_errors
         async def cb():
-            prof = await self.server.get_profile(
-                key=self.key, start=self.start, stop=self.stop
-            )
-            if update_metadata:
-                metadata = await self.server.get_profile_metadata()
-            else:
-                metadata = None
-            if isinstance(prof, gen.Future):
-                prof, metadata = await asyncio.gather(prof, metadata)
-            self.doc().add_next_tick_callback(lambda: self.update(prof, metadata))
+            with log_errors():
+                prof = await self.server.get_profile(
+                    key=self.key, start=self.start, stop=self.stop
+                )
+                if update_metadata:
+                    metadata = await self.server.get_profile_metadata()
+                else:
+                    metadata = None
+                if isinstance(prof, gen.Future):
+                    prof, metadata = await asyncio.gather(prof, metadata)
+                self.doc().add_next_tick_callback(lambda: self.update(prof, metadata))
 
         self.server.loop.add_callback(cb)
 
@@ -338,20 +357,33 @@ class ProfileServer(DashboardComponent):
         changing = [False]  # avoid repeated changes from within callback
 
         @without_property_validation
-        @log_errors
         def cb(attr, old, new):
-            if changing[0] or len(new) == 0:
+            if changing[0]:
                 return
+            with log_errors():
+                if isinstance(new, list):  # bokeh >= 1.0
+                    selected = new
+                else:
+                    selected = new["1d"]["indices"]
+                try:
+                    ind = selected[0]
+                except IndexError:
+                    return
+                data = profile.plot_data(self.states[ind], profile_interval)
+                del self.states[:]
+                self.states.extend(data.pop("states"))
+                changing[0] = True  # don't recursively trigger callback
+                update(self.source, data)
+                if isinstance(new, list):  # bokeh >= 1.0
+                    self.source.selected.indices = old
+                else:
+                    self.source.selected = old
+                changing[0] = False
 
-            data = profile.plot_data(self.states[new[0]], profile_interval)
-            del self.states[:]
-            self.states.extend(data.pop("states"))
-            changing[0] = True  # don't recursively trigger callback
-            update(self.source, data)
-            self.source.selected.indices = old
-            changing[0] = False
-
-        self.source.selected.on_change("indices", cb)
+        if BOKEH_VERSION >= "1.0.0":
+            self.source.selected.on_change("indices", cb)
+        else:
+            self.source.on_change("selected", cb)
 
         self.ts_source = ColumnDataSource({"time": [], "count": []})
         self.ts_plot = figure(
@@ -370,18 +402,24 @@ class ProfileServer(DashboardComponent):
         self.ts_plot.yaxis.visible = False
         self.ts_plot.grid.visible = False
 
-        @log_errors
         def ts_change(attr, old, new):
-            selected = self.ts_source.selected.indices
-            if selected:
-                start = self.ts_source.data["time"][min(selected)] / 1000
-                stop = self.ts_source.data["time"][max(selected)] / 1000
-                self.start, self.stop = min(start, stop), max(start, stop)
-            else:
-                self.start = self.stop = None
-            self.trigger_update()
+            with log_errors():
+                try:
+                    selected = self.ts_source.selected.indices
+                except AttributeError:
+                    selected = self.ts_source.selected["1d"]["indices"]
+                if selected:
+                    start = self.ts_source.data["time"][min(selected)] / 1000
+                    stop = self.ts_source.data["time"][max(selected)] / 1000
+                    self.start, self.stop = min(start, stop), max(start, stop)
+                else:
+                    self.start = self.stop = None
+                self.trigger_update()
 
-        self.ts_source.selected.on_change("indices", ts_change)
+        if BOKEH_VERSION >= "1.0.0":
+            self.ts_source.selected.on_change("indices", ts_change)
+        else:
+            self.ts_source.on_change("selected", ts_change)
 
         self.reset_button = Button(label="Reset", button_type="success")
         self.reset_button.on_click(lambda: self.update(self.state))
@@ -393,23 +431,16 @@ class ProfileServer(DashboardComponent):
             row(self.reset_button, self.update_button, sizing_mode="scale_width"),
             self.profile_plot,
             self.ts_plot,
-            **kwargs,
+            **kwargs
         )
 
-        self.subtitle = Title(text=" ", text_font_style="italic")
-        self.profile_plot.add_layout(self.subtitle, "above")
-        if not dask.config.get("distributed.worker.profile.enabled"):
-            self.subtitle.text = "Profiling is disabled."
-            self.reset_button.disabled = True
-            self.update_button.disabled = True
-
     @without_property_validation
-    @log_errors
     def update(self, state):
-        self.state = state
-        data = profile.plot_data(self.state, profile_interval)
-        self.states = data.pop("states")
-        update(self.source, data)
+        with log_errors():
+            self.state = state
+            data = profile.plot_data(self.state, profile_interval)
+            self.states = data.pop("states")
+            update(self.source, data)
 
     @without_property_validation
     def trigger_update(self):
@@ -423,23 +454,12 @@ class ProfileServer(DashboardComponent):
 
 
 class SystemMonitor(DashboardComponent):
-    def __init__(self, worker, height=150, last_count=None, **kwargs):
+    def __init__(self, worker, height=150, **kwargs):
         self.worker = worker
 
         names = worker.monitor.quantities
-        self.last_count = 0
-        if last_count is not None:
-            names = worker.monitor.range_query(start=last_count)
-            self.last_count = last_count
+        self.last = 0
         self.source = ColumnDataSource({name: [] for name in names})
-        self.label_source = ColumnDataSource(
-            {
-                "x": [5] * 3,
-                "y": [70, 55, 40],
-                "cpu": ["max: 45%", "min: 45%", "mean: 45%"],
-                "memory": ["max: 133.5MiB", "min: 23.6MiB", "mean: 115.4MiB"],
-            }
-        )
         update(self.source, self.get_data())
 
         x_range = DataRange1d(follow="end", follow_interval=20000, range_padding=0)
@@ -451,68 +471,31 @@ class SystemMonitor(DashboardComponent):
             x_axis_type="datetime",
             height=height,
             tools=tools,
-            toolbar_location="above",
             x_range=x_range,
-            **kwargs,
+            **kwargs
         )
         self.cpu.line(source=self.source, x="time", y="cpu")
         self.cpu.yaxis.axis_label = "Percentage"
-        self.cpu.add_layout(
-            LabelSet(
-                x="x",
-                y="y",
-                x_units="screen",
-                y_units="screen",
-                text="cpu",
-                text_font_size="1em",
-                source=self.label_source,
-            )
-        )
         self.mem = figure(
             title="Memory",
             x_axis_type="datetime",
             height=height,
             tools=tools,
-            toolbar_location="above",
             x_range=x_range,
-            **kwargs,
+            **kwargs
         )
         self.mem.line(source=self.source, x="time", y="memory")
         self.mem.yaxis.axis_label = "Bytes"
-        self.mem.add_layout(
-            LabelSet(
-                x="x",
-                y="y",
-                x_units="screen",
-                y_units="screen",
-                text="memory",
-                text_font_size="1em",
-                source=self.label_source,
-            )
-        )
         self.bandwidth = figure(
             title="Bandwidth",
             x_axis_type="datetime",
             height=height,
             x_range=x_range,
             tools=tools,
-            toolbar_location="above",
-            **kwargs,
+            **kwargs
         )
-        self.bandwidth.line(
-            source=self.source,
-            x="time",
-            y="host_net_io.read_bps",
-            color="red",
-            legend_label="read",
-        )
-        self.bandwidth.line(
-            source=self.source,
-            x="time",
-            y="host_net_io.write_bps",
-            color="blue",
-            legend_label="write",
-        )
+        self.bandwidth.line(source=self.source, x="time", y="read_bytes", color="red")
+        self.bandwidth.line(source=self.source, x="time", y="write_bytes", color="blue")
         self.bandwidth.yaxis.axis_label = "Bytes / second"
 
         # self.cpu.yaxis[0].formatter = NumeralTickFormatter(format='0%')
@@ -528,8 +511,7 @@ class SystemMonitor(DashboardComponent):
                 height=height,
                 x_range=x_range,
                 tools=tools,
-                toolbar_location="above",
-                **kwargs,
+                **kwargs
             )
 
             self.num_fds.line(source=self.source, x="time", y="num_fds")
@@ -550,25 +532,12 @@ class SystemMonitor(DashboardComponent):
         self.worker.monitor.update()
 
     def get_data(self):
-        d = self.worker.monitor.range_query(start=self.last_count)
+        d = self.worker.monitor.range_query(start=self.last)
         d["time"] = [x * 1000 for x in d["time"]]
-        self.last_count = self.worker.monitor.count
+        self.last = self.worker.monitor.count
         return d
 
     @without_property_validation
-    @log_errors
     def update(self):
-        def mean(x):
-            return sum(x) / len(x)
-
-        self.source.stream(self.get_data(), 1000)
-        self.label_source.data["cpu"] = [
-            "{}: {:.1f}%".format(f.__name__, f(self.source.data["cpu"]))
-            for f in [min, max, mean]
-        ]
-        self.label_source.data["memory"] = [
-            "{}: {}".format(
-                f.__name__, dask.utils.format_bytes(f(self.source.data["memory"]))
-            )
-            for f in [min, max, mean]
-        ]
+        with log_errors():
+            self.source.stream(self.get_data(), 1000)

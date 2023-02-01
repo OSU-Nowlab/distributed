@@ -1,13 +1,6 @@
-from __future__ import annotations
+from .serialize import dask_serialize, dask_deserialize, serialize, deserialize
 
 import netCDF4
-
-from distributed.protocol.serialize import (
-    dask_deserialize,
-    dask_serialize,
-    deserialize,
-    serialize,
-)
 
 
 @dask_serialize.register(netCDF4.Dataset)

@@ -1,7 +1,6 @@
 # https://pytest.org/latest/example/simple.html#control-skipping-of-tests-according-to-command-line-option
-from __future__ import annotations
-
 import pytest
+
 
 # Uncomment to enable more logging and checks
 # (https://docs.python.org/3/library/asyncio-dev.html)
@@ -18,9 +17,6 @@ else:
     except Exception:
         pass
 
-# Make all fixtures available
-from distributed.utils_test import *  # noqa
-
 
 def pytest_addoption(parser):
     parser.addoption("--runslow", action="store_true", help="run slow tests")
@@ -34,9 +30,6 @@ def pytest_collection_modifyitems(config, items):
     for item in items:
         if "slow" in item.keywords:
             item.add_marker(skip_slow)
-
-        if "ws" in item.fixturenames:
-            item.add_marker(pytest.mark.workerstate)
 
 
 pytest_plugins = ["distributed.pytest_resourceleaks"]

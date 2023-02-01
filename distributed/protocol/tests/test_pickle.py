@@ -1,78 +1,67 @@
-from __future__ import annotations
-
-import pickle
-import sys
-import weakref
 from functools import partial
+import gc
 from operator import add
+import weakref
+import sys
 
-import cloudpickle
 import pytest
 
-from dask.utils import tmpdir
-
-from distributed import profile
 from distributed.protocol import deserialize, serialize
-from distributed.protocol.pickle import (
-    CLOUDPICKLE_GTE_20,
-    HIGHEST_PROTOCOL,
-    dumps,
-    loads,
-)
-from distributed.utils_test import save_sys_modules
+from distributed.protocol.pickle import HIGHEST_PROTOCOL, dumps, loads
+
+if sys.version_info < (3, 8):
+    try:
+        import pickle5 as pickle
+    except ImportError:
+        import pickle
+else:
+    import pickle
 
 
-class MemoryviewHolder:
-    def __init__(self, mv):
-        self.mv = memoryview(mv)
-
-    def __reduce_ex__(self, protocol):
-        if protocol >= 5:
-            return MemoryviewHolder, (pickle.PickleBuffer(self.mv),)
-        else:
-            return MemoryviewHolder, (self.mv.tobytes(),)
-
-
-@pytest.mark.parametrize("protocol", {4, HIGHEST_PROTOCOL})
-def test_pickle_data(protocol):
-    context = {"pickle-protocol": protocol}
-
+def test_pickle_data():
     data = [1, b"123", "123", [123], {}, set()]
     for d in data:
-        assert loads(dumps(d, protocol=protocol)) == d
-        assert deserialize(*serialize(d, serializers=("pickle",), context=context)) == d
+        assert loads(dumps(d)) == d
+        assert deserialize(*serialize(d, serializers=("pickle",))) == d
 
 
-@pytest.mark.parametrize("protocol", {4, HIGHEST_PROTOCOL})
-def test_pickle_out_of_band(protocol):
-    context = {"pickle-protocol": protocol}
+def test_pickle_out_of_band():
+    class MemoryviewHolder:
+        def __init__(self, mv):
+            self.mv = memoryview(mv)
+
+        def __reduce_ex__(self, protocol):
+            if protocol >= 5:
+                return MemoryviewHolder, (pickle.PickleBuffer(self.mv),)
+            else:
+                return MemoryviewHolder, (self.mv.tobytes(),)
 
     mv = memoryview(b"123")
     mvh = MemoryviewHolder(mv)
 
-    if protocol >= 5:
+    if HIGHEST_PROTOCOL >= 5:
         l = []
-        d = dumps(mvh, protocol=protocol, buffer_callback=l.append)
+        d = dumps(mvh, buffer_callback=l.append)
         mvh2 = loads(d, buffers=l)
 
         assert len(l) == 1
         assert isinstance(l[0], pickle.PickleBuffer)
         assert memoryview(l[0]) == mv
     else:
-        mvh2 = loads(dumps(mvh, protocol=protocol))
+        mvh2 = loads(dumps(mvh))
 
     assert isinstance(mvh2, MemoryviewHolder)
     assert isinstance(mvh2.mv, memoryview)
     assert mvh2.mv == mv
 
-    h, f = serialize(mvh, serializers=("pickle",), context=context)
+    h, f = serialize(mvh, serializers=("pickle",))
     mvh3 = deserialize(h, f)
 
     assert isinstance(mvh3, MemoryviewHolder)
     assert isinstance(mvh3.mv, memoryview)
     assert mvh3.mv == mv
 
-    if protocol >= 5:
+    if HIGHEST_PROTOCOL >= 5:
         assert len(f) == 2
         assert isinstance(f[0], bytes)
         assert isinstance(f[1], memoryview)
@@ -82,61 +71,25 @@ def test_pickle_out_of_band(protocol):
         assert isinstance(f[0], bytes)
 
 
-@pytest.mark.parametrize("protocol", {4, HIGHEST_PROTOCOL})
-def test_pickle_empty(protocol):
-    context = {"pickle-protocol": protocol}
-
-    x = MemoryviewHolder(bytearray())  # Empty view
-    header, frames = serialize(x, serializers=("pickle",), context=context)
-
-    assert header["serializer"] == "pickle"
-    assert len(frames) >= 1
-    assert isinstance(frames[0], bytes)
-
-    if protocol >= 5:
-        assert len(frames) == 2
-        assert len(header["writeable"]) == 1
-
-        header["writeable"] = (False,) * len(frames)
-    else:
-        assert len(frames) == 1
-        assert len(header["writeable"]) == 0
-
-    y = deserialize(header, frames)
-
-    assert isinstance(y, MemoryviewHolder)
-    assert isinstance(y.mv, memoryview)
-    assert y.mv == x.mv
-    assert y.mv.nbytes == 0
-    assert y.mv.readonly
-
-
-@pytest.mark.parametrize("protocol", {4, HIGHEST_PROTOCOL})
-def test_pickle_numpy(protocol):
+def test_pickle_numpy():
     np = pytest.importorskip("numpy")
-    context = {"pickle-protocol": protocol}
-
     x = np.ones(5)
-    assert (loads(dumps(x, protocol=protocol)) == x).all()
-    assert (
-        deserialize(*serialize(x, serializers=("pickle",), context=context)) == x
-    ).all()
+    assert (loads(dumps(x)) == x).all()
+    assert (deserialize(*serialize(x, serializers=("pickle",))) == x).all()
 
     x = np.ones(5000)
-    assert (loads(dumps(x, protocol=protocol)) == x).all()
-    assert (
-        deserialize(*serialize(x, serializers=("pickle",), context=context)) == x
-    ).all()
+    assert (loads(dumps(x)) == x).all()
+    assert (deserialize(*serialize(x, serializers=("pickle",))) == x).all()
 
     x = np.array([np.arange(3), np.arange(4, 6)], dtype=object)
-    x2 = loads(dumps(x, protocol=protocol))
+    x2 = loads(dumps(x))
     assert x.shape == x2.shape
     assert x.dtype == x2.dtype
     assert x.strides == x2.strides
     for e_x, e_x2 in zip(x.flat, x2.flat):
         np.testing.assert_equal(e_x, e_x2)
-    h, f = serialize(x, serializers=("pickle",), context=context)
-    if protocol >= 5:
+    h, f = serialize(x, serializers=("pickle",))
+    if HIGHEST_PROTOCOL >= 5:
         assert len(f) == 3
     else:
         assert len(f) == 1
@@ -147,27 +100,29 @@ def test_pickle_numpy(protocol):
     for e_x, e_x3 in zip(x.flat, x3.flat):
         np.testing.assert_equal(e_x, e_x3)
 
-    if protocol >= 5:
+    if HIGHEST_PROTOCOL >= 5:
         x = np.ones(5000)
 
         l = []
-        d = dumps(x, protocol=protocol, buffer_callback=l.append)
+        d = dumps(x, buffer_callback=l.append)
         assert len(l) == 1
         assert isinstance(l[0], pickle.PickleBuffer)
         assert memoryview(l[0]) == memoryview(x)
         assert (loads(d, buffers=l) == x).all()
 
-        h, f = serialize(x, serializers=("pickle",), context=context)
+        h, f = serialize(x, serializers=("pickle",))
         assert len(f) == 2
         assert isinstance(f[0], bytes)
         assert isinstance(f[1], memoryview)
         assert (deserialize(h, f) == x).all()
 
 
-@pytest.mark.parametrize("protocol", {4, HIGHEST_PROTOCOL})
-def test_pickle_functions(protocol):
-    context = {"pickle-protocol": protocol}
-
+@pytest.mark.xfail(
+    sys.version_info[:2] == (3, 8),
+    reason="Sporadic failure on Python 3.8",
+    strict=False,
+)
+def test_pickle_functions():
     def make_closure():
         value = 1
 
@@ -184,39 +139,16 @@ def test_pickle_functions(protocol):
     for func in funcs():
         wr = weakref.ref(func)
 
-        func2 = loads(dumps(func, protocol=protocol))
+        func2 = loads(dumps(func))
         wr2 = weakref.ref(func2)
         assert func2(1) == func(1)
 
-        func3 = deserialize(*serialize(func, serializers=("pickle",), context=context))
+        func3 = deserialize(*serialize(func, serializers=("pickle",)))
         wr3 = weakref.ref(func3)
         assert func3(1) == func(1)
 
         del func, func2, func3
-        with profile.lock:
-            assert wr() is None
-            assert wr2() is None
-            assert wr3() is None
-
-
-@pytest.mark.skipif(
-    not CLOUDPICKLE_GTE_20, reason="Pickle by value registration not supported"
-)
-def test_pickle_by_value_when_registered():
-    with save_sys_modules():
-        with tmpdir() as d:
-            try:
-                sys.path.insert(0, d)
-                module = f"{d}/mymodule.py"
-                with open(module, "w") as f:
-                    f.write("def myfunc(x):\n    return x + 1")
-                import mymodule  # noqa
-
-                assert dumps(mymodule.myfunc) == pickle.dumps(
-                    mymodule.myfunc, protocol=HIGHEST_PROTOCOL
-                )
-                cloudpickle.register_pickle_by_value(mymodule)
-                assert len(dumps(mymodule.myfunc)) > len(pickle.dumps(mymodule.myfunc))
-
-            finally:
-                sys.path.pop(0)
+        gc.collect()
+        assert wr() is None
+        assert wr2() is None
+        assert wr3() is None

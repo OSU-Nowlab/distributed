@@ -1,5 +1,3 @@
-from __future__ import annotations
-
 import contextlib
 import gc
 import itertools
@@ -48,7 +46,7 @@ def test_fractional_timer():
 
     timer = RandomTimer()
     ft = FractionalTimer(n_samples=N, timer=timer)
-    for _ in range(N):
+    for i in range(N):
         ft.start_timing()
         ft.stop_timing()
     assert len(timer.timings) == N * 2
@@ -60,7 +58,7 @@ def test_fractional_timer():
     assert ft.running_fraction is not None
     check_fraction(timer, ft)
 
-    for _ in range(N * 10):
+    for i in range(N * 10):
         ft.start_timing()
         ft.stop_timing()
         check_fraction(timer, ft)
@@ -83,14 +81,13 @@ def enable_gc_diagnosis_and_log(diag, level="INFO"):
             gc.enable()
 
 
-@pytest.mark.slow
 def test_gc_diagnosis_cpu_time():
     diag = GCDiagnosis(warn_over_frac=0.75)
     diag.N_SAMPLES = 3  # shorten tests
 
     with enable_gc_diagnosis_and_log(diag, level="WARN") as sio:
         # Spend some CPU time doing only full GCs
-        for _ in range(diag.N_SAMPLES):
+        for i in range(diag.N_SAMPLES):
             gc.collect()
         assert not sio.getvalue()
         gc.collect()
@@ -104,7 +101,7 @@ def test_gc_diagnosis_cpu_time():
 
     with enable_gc_diagnosis_and_log(diag, level="WARN") as sio:
         # Spend half the CPU time doing full GCs
-        for _ in range(diag.N_SAMPLES + 1):
+        for i in range(diag.N_SAMPLES + 1):
             t1 = thread_time()
             gc.collect()
             dt = thread_time() - t1
@@ -113,7 +110,7 @@ def test_gc_diagnosis_cpu_time():
         assert not sio.getvalue()
 
 
-@pytest.mark.xfail(reason="flaky and re-fails on rerun")
+@pytest.mark.xfail(reason="unknown")
 def test_gc_diagnosis_rss_win():
     diag = GCDiagnosis(info_over_rss_win=10e6)
 

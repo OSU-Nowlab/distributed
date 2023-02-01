@@ -1,27 +1,26 @@
-from __future__ import annotations
-
 import asyncio
-import logging
-import pickle
-import signal
 from datetime import timedelta
-from time import sleep
-
-import pytest
-
+import pickle
 import dask
+import pytest
 from dask.distributed import Client
-
+from time import time, sleep
 from distributed import Semaphore, fire_and_forget
+from distributed.comm import Comm
 from distributed.core import ConnectionPool
 from distributed.metrics import time
-from distributed.utils_test import (
-    BrokenComm,
-    captured_logger,
+from distributed.utils_test import (  # noqa: F401
+    client,
+    cleanup,
     cluster,
+    async_wait_for,
+    captured_logger,
+    cluster_fixture,
     gen_cluster,
     slowidentity,
+    loop,
 )
+import logging
 
 
 @gen_cluster(client=True)
@@ -48,7 +47,7 @@ async def test_serializable(c, s, a, b):
     assert res
     sem2 = pickle.loads(pickle.dumps(sem))
     assert sem2.name == sem.name
-    # assert sem2.client.scheduler.address == sem.client.scheduler.address
+    assert sem2.client.scheduler.address == sem.client.scheduler.address
 
     # actual leases didn't change
     assert len(s.extensions["semaphores"].leases["x"]) == 1
@@ -74,8 +73,6 @@ async def test_release_simple(c, s, a, b):
             return x + 1
 
     sem = await Semaphore(max_leases=2, name="x")
-
-    assert s.extensions["semaphores"]._semaphore_exists("x")
     futures = c.map(f, list(range(10)), semaphore=sem)
     await c.gather(futures)
 
@@ -98,27 +95,36 @@ def test_timeout_sync(client):
 
 
 @gen_cluster(
+    client=True,
+    timeout=20,
     config={
-        "distributed.scheduler.locks.lease-validation-interval": "200ms",
-        "distributed.scheduler.locks.lease-timeout": "200ms",
+        "distributed.scheduler.locks.lease-validation-interval": "500ms",
+        "distributed.scheduler.locks.lease-timeout": "500ms",
     },
 )
-async def test_release_semaphore_after_timeout(s, a, b):
+async def test_release_semaphore_after_timeout(c, s, a, b):
     sem = await Semaphore(name="x", max_leases=2)
     await sem.acquire()  # leases: 2 - 1 = 1
+    semY = await Semaphore(name="y")
 
-    semB = await Semaphore(name="x", max_leases=2)
-    assert await semB.acquire()  # leases: 1 - 1 = 0
-    assert not (await sem.acquire(timeout=0.01))
-    assert not (await semB.acquire(timeout=0.01))
+    async with Client(s.address, asynchronous=True, name="ClientB") as clientB:
+        semB = await Semaphore(name="x", max_leases=2, client=clientB)
+        semYB = await Semaphore(name="y", client=clientB)
 
-    # B goes out of scope / cannot refresh anymore. For instance, because its
-    # worker died
+        assert await semB.acquire()  # leases: 1 - 1 = 0
+        assert await semYB.acquire()
 
-    semB.refresh_callback.stop()
-    del semB
-    assert await sem.acquire(timeout=1)
-    assert not (await sem.acquire(timeout=0.1))
+        assert not (await sem.acquire(timeout=0.01))
+        assert not (await semB.acquire(timeout=0.01))
+        assert not (await semYB.acquire(timeout=0.01))
+
+    # `ClientB` goes out of scope, leases should be released
+    # At this point, we should be able to acquire x and y once
+    assert await sem.acquire()
+    assert await semY.acquire()
+
+    assert not (await semY.acquire(timeout=0.5))
+    assert not (await sem.acquire(timeout=0.5))
 
 
 @gen_cluster()
@@ -129,14 +135,10 @@ async def test_async_ctx(s, a, b):
     assert await sem.acquire()
 
 
-def test_worker_dies(loop):
-    with cluster(
-        config={
-            "distributed.scheduler.locks.lease-timeout": "50ms",
-            "distributed.scheduler.locks.lease-validation-interval": "10ms",
-        }
-    ) as (scheduler, workers):
-        with Client(scheduler["address"], loop=loop) as client:
+@pytest.mark.slow
+def test_worker_dies():
+    with cluster(disconnect_timeout=10) as (scheduler, workers):
+        with Client(scheduler["address"]) as client:
             sem = Semaphore(name="x", max_leases=1)
 
             def f(x, sem, kill_address):
@@ -147,15 +149,15 @@ def test_worker_dies(loop):
                     if worker.address == kill_address:
                         import os
 
-                        os.kill(os.getpid(), signal.SIGTERM)
+                        os.kill(os.getpid(), 15)
                     return x
 
             futures = client.map(
-                f, range(10), sem=sem, kill_address=workers[0]["address"]
+                f, range(100), sem=sem, kill_address=workers[0]["address"]
             )
             results = client.gather(futures)
 
-            assert sorted(results) == list(range(10))
+            assert sorted(results) == list(range(100))
 
 
 @gen_cluster(client=True)
@@ -191,8 +193,8 @@ async def test_access_semaphore_by_name(c, s, a, b):
     assert result.count(False) == 9
 
 
-@gen_cluster(client=True, nthreads=[("", 1)])
-async def test_close_async(c, s, a):
+@gen_cluster(client=True)
+async def test_close_async(c, s, a, b):
     sem = await Semaphore(name="test")
 
     assert await sem.acquire()
@@ -211,7 +213,7 @@ async def test_close_async(c, s, a):
     assert await sem2.acquire()
 
     def f(sem_):
-        sem_.acquire(timeout="0.5s")
+        return sem_.acquire()
 
     semaphore_object = s.extensions["semaphores"]
     fire_and_forget(c.submit(f, sem_=sem2))
@@ -270,6 +272,26 @@ async def test_release_once_too_many_resilience(c, s, a, b):
     assert len(s.extensions["semaphores"].leases["x"]) == 1
 
 
+class BrokenComm(Comm):
+    peer_address = None
+    local_address = None
+
+    def close(self):
+        pass
+
+    def closed(self):
+        return True
+
+    def abort(self):
+        pass
+
+    def read(self, deserializers=None):
+        raise EnvironmentError
+
+    def write(self, msg, serializers=None, on_error=None):
+        raise EnvironmentError
+
+
 class FlakyConnectionPool(ConnectionPool):
     def __init__(self, *args, failing_connections=0, **kwargs):
         self.cnn_count = 0
@@ -290,20 +312,16 @@ class FlakyConnectionPool(ConnectionPool):
             self.cnn_count += 1
             return BrokenComm()
 
-    def reuse(self, addr, comm):
-        pass
-
 
 @gen_cluster(client=True)
 async def test_retry_acquire(c, s, a, b):
     with dask.config.set({"distributed.comm.retry.count": 1}):
 
         pool = await FlakyConnectionPool(failing_connections=1)
-
+        rpc = pool(s.address)
+        c.scheduler = rpc
         semaphore = await Semaphore(
-            max_leases=2,
-            name="resource_we_want_to_limit",
-            scheduler_rpc=pool(s.address),
+            max_leases=2, name="resource_we_want_to_limit", client=c
         )
         pool.activate()
 
@@ -404,25 +422,25 @@ async def test_oversubscribing_leases(c, s, a, b):
         client = get_client()
         client.set_metadata("release", True)
 
-    async with Worker(s.address) as observer:
-        futures = c.map(
-            guaranteed_lease_timeout, range(2), sem=sem, workers=[a.address, b.address]
-        )
-        fut_observe = c.submit(observe_state, sem=sem, workers=[observer.address])
+    observer = await Worker(s.address)
 
-        with captured_logger("distributed.semaphore", level=logging.DEBUG) as caplog:
-            payload, _ = await c.gather([futures, fut_observe])
+    futures = c.map(
+        guaranteed_lease_timeout, range(2), sem=sem, workers=[a.address, b.address]
+    )
+    fut_observe = c.submit(observe_state, sem=sem, workers=[observer.address])
+
+    with captured_logger("distributed.semaphore") as caplog:
+        payload, observer = await c.gather([futures, fut_observe])
 
     logs = caplog.getvalue().split("\n")
     timeouts = [log for log in logs if "timed out" in log]
     refresh_unknown = [log for log in logs if "Refreshing an unknown lease ID" in log]
-    assert len(timeouts) >= 2
-    assert len(refresh_unknown) >= 2
+    assert len(timeouts) == 2
+    assert len(refresh_unknown) == 2
 
     assert sorted(payload) == [0, 1]
     # Back to normal
-    while await sem.get_value():
-        await asyncio.sleep(0.01)
+    assert await sem.get_value() == 0
 
 
 @gen_cluster(client=True)
@@ -480,47 +498,30 @@ async def test_metrics(c, s, a, b):
     assert actual == expected
 
 
-def test_threadpoolworkers_pick_correct_ioloop(cleanup, loop):
+def test_threadpoolworkers_pick_correct_ioloop(cleanup):
     # gh4057
-
-    # About picking appropriate values for the various timings
-    # * Sleep time in `access_limited` impacts test runtime but is arbitrary
-    # * `lease-timeout` should be smaller than the sleep time. This is what the
-    #   test builds on. assuming the leases cannot be refreshed, e.g. wrong
-    #   event loop picked / PeriodicCallback never scheduled, the semaphore
-    #   would become oversubscribed and the len(protected_resources) becomes
-    #   non zero. This should also trigger a log message about "unknown leases"
-    #   and fails the test.
-    # * `lease-validation-interval` interval should be the smallest quantity.
-    #   How often leases are checked for staleness is hard coded atm and a fifth
-    #   of the `lease-timeout`. Accounting for this and some jitter, this should
-    #   be sufficiently small to ensure smooth operation.
 
     with dask.config.set(
         {
             "distributed.scheduler.locks.lease-validation-interval": 0.01,
-            "distributed.scheduler.locks.lease-timeout": 0.1,
+            "distributed.scheduler.locks.lease-timeout": 0.05,
         }
     ):
-        with Client(
-            processes=False, dashboard_address=":0", threads_per_worker=4, loop=loop
-        ) as client:
-            sem = Semaphore(max_leases=1, name="database", loop=None)
-            assert sem.loop is loop
-            protected_resource = []
+        with Client(processes=False, threads_per_worker=4) as client:
+            sem = Semaphore(max_leases=1, name="database")
+            protected_ressource = []
 
             def access_limited(val, sem):
                 import time
 
                 with sem:
-                    assert len(protected_resource) == 0
-                    protected_resource.append(val)
+                    assert len(protected_ressource) == 0
+                    protected_ressource.append(val)
                     # Interact with the DB
-                    time.sleep(0.01)
-                    protected_resource.remove(val)
+                    time.sleep(0.1)
+                    protected_ressource.remove(val)
 
             client.gather(client.map(access_limited, range(10), sem=sem))
-            assert sem.refresh_callback.io_loop is loop
 
 
 @gen_cluster(client=True)
@@ -528,11 +529,10 @@ async def test_release_retry(c, s, a, b):
     """Verify that we can properly retry a semaphore release operation"""
     with dask.config.set({"distributed.comm.retry.count": 1}):
         pool = await FlakyConnectionPool(failing_connections=1)
-
+        rpc = pool(s.address)
+        c.scheduler = rpc
         semaphore = await Semaphore(
-            max_leases=2,
-            name="resource_we_want_to_limit",
-            scheduler_rpc=pool(s.address),
+            max_leases=2, name="resource_we_want_to_limit", client=c
         )
         await semaphore.acquire()
         pool.activate()  # Comm chaos starts
@@ -555,25 +555,46 @@ async def test_release_retry(c, s, a, b):
         "distributed.scheduler.locks.lease-validation-interval": "100ms",
     },
 )
-async def test_release_failure(c, s, a, b, caplog):
-    """Don't raise even if release fails: lease will be cleaned up by the
-    lease-validation after a specified interval anyway (see config parameters used).
-    """
+async def test_release_failure(c, s, a, b):
+    """Don't raise even if release fails: lease will be cleaned up by the lease-validation after
+    a specified interval anyways (see config parameters used)."""
 
     with dask.config.set({"distributed.comm.retry.count": 1}):
         pool = await FlakyConnectionPool(failing_connections=5)
-        ext = s.extensions["semaphores"]
-        name = "foo"
+        rpc = pool(s.address)
+        c.scheduler = rpc
         semaphore = await Semaphore(
-            max_leases=2,
-            name=name,
-            scheduler_rpc=pool(s.address),
+            max_leases=2, name="resource_we_want_to_limit", client=c
         )
         await semaphore.acquire()
         pool.activate()  # Comm chaos starts
-        assert await semaphore.release() is False
 
-        pool.deactivate()  # comm chaos stops
-        assert ext.get_value(name) == 1  # lease is still registered
-        while not (await semaphore.get_value() == 0):
-            await asyncio.sleep(0.01)
+        # Release fails (after a single retry) because of broken connections
+        with captured_logger(
+            "distributed.semaphore", level=logging.ERROR
+        ) as semaphore_log:
+            with captured_logger("distributed.utils_comm") as retry_log:
+                assert await semaphore.release() is False
+
+        with captured_logger("distributed.semaphore") as semaphore_cleanup_log:
+            pool.deactivate()  # comm chaos stops
+            assert await semaphore.get_value() == 1  # lease is still registered
+            await asyncio.sleep(0.2)  # Wait for lease to be cleaned up
+
+        # Check release was retried
+        retry_log = retry_log.getvalue().split("\n")[0]
+        assert retry_log.startswith(
+            "Retrying semaphore release:"
+        ) and retry_log.endswith("after exception in attempt 0/1: ")
+        # Check release failed
+        semaphore_log = semaphore_log.getvalue().split("\n")[0]
+        assert semaphore_log.startswith(
+            "Release failed for client="
+        ) and semaphore_log.endswith("Cluster network might be unstable?")
+
+        # Check lease has timed out
+        assert any(
+            log.startswith("Lease") and "timed out after" in log
+            for log in semaphore_cleanup_log.getvalue().split("\n")
+        )
+        assert await semaphore.get_value() == 0

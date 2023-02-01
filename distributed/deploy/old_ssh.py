@@ -1,19 +1,21 @@
-from __future__ import annotations
-
 import logging
-import os
 import socket
+import os
 import sys
+import time
 import traceback
-import warnings
-from queue import Queue
+
+try:
+    from queue import Queue
+except ImportError:  # Python 2.7 fix
+    from Queue import Queue
+
 from threading import Thread
-from time import sleep
 
 from tlz import merge
+
 from tornado import gen
 
-from distributed.metrics import time
 
 logger = logging.getLogger(__name__)
 
@@ -34,7 +36,7 @@ class bcolors:
 def async_ssh(cmd_dict):
     import paramiko
     from paramiko.buffered_pipe import PipeTimeout
-    from paramiko.ssh_exception import PasswordRequiredException, SSHException
+    from paramiko.ssh_exception import SSHException, PasswordRequiredException
 
     ssh = paramiko.SSHClient()
     ssh.set_missing_host_key_policy(paramiko.AutoAddPolicy())
@@ -51,8 +53,8 @@ def async_ssh(cmd_dict):
                 port=cmd_dict["ssh_port"],
                 key_filename=cmd_dict["ssh_private_key"],
                 compress=True,
-                timeout=30,
-                banner_timeout=30,
+                timeout=20,
+                banner_timeout=20,
             )  # Helps prevent timeouts when many concurrent ssh connections are opened.
             # Connection successful, break out of while loop
             break
@@ -60,9 +62,9 @@ def async_ssh(cmd_dict):
         except (SSHException, PasswordRequiredException) as e:
 
             print(
-                "[ dask ssh ] : "
+                "[ dask-ssh ] : "
                 + bcolors.FAIL
-                + "SSH connection error when connecting to {addr}:{port} "
+                + "SSH connection error when connecting to {addr}:{port}"
                 "to run '{cmd}'".format(
                     addr=cmd_dict["address"],
                     port=cmd_dict["ssh_port"],
@@ -87,7 +89,7 @@ def async_ssh(cmd_dict):
             retries += 1
             if retries >= 3:
                 print(
-                    "[ dask ssh ] : "
+                    "[ dask-ssh ] : "
                     + bcolors.FAIL
                     + "SSH connection failed after 3 retries. Exiting."
                     + bcolors.ENDC
@@ -100,11 +102,11 @@ def async_ssh(cmd_dict):
             print(
                 "               "
                 + bcolors.FAIL
-                + f"Retrying... (attempt {retries}/3)"
+                + "Retrying... (attempt {n}/{total})".format(n=retries, total=3)
                 + bcolors.ENDC
             )
 
-            sleep(1)
+            time.sleep(1)
 
     # Execute the command, and grab file handles for stdout and stderr. Note
     # that we run the command using the user's default shell, but force it to
@@ -152,7 +154,7 @@ def async_ssh(cmd_dict):
                 cmd_dict["output_queue"].put(
                     "[ {label} ] : ".format(label=cmd_dict["label"])
                     + bcolors.FAIL
-                    + line
+                    + "{output}".format(output=line)
                     + bcolors.ENDC
                 )
                 line = stderr.readline()
@@ -187,19 +189,19 @@ def async_ssh(cmd_dict):
     # thread to shut itself down.
     while cmd_dict["input_queue"].empty():
         # Kill some time so that this thread does not hog the CPU.
-        sleep(1.0)
+        time.sleep(1.0)
         # Send noise down the pipe to keep connection active
         transport.send_ignore()
         if communicate():
             break
 
     # Ctrl-C the executing command and wait a bit for command to end cleanly
-    start = time()
-    while time() < start + 5.0:
+    start = time.time()
+    while time.time() < start + 5.0:
         channel.send(b"\x03")  # Ctrl-C
         if communicate():
             break
-        sleep(1.0)
+        time.sleep(1.0)
 
     # Shutdown the channel, and close the SSH connection
     channel.close()
@@ -215,14 +217,18 @@ def start_scheduler(
 
     # Optionally re-direct stdout and stderr to a logfile
     if logdir is not None:
-        cmd = f"mkdir -p {logdir} && {cmd}"
+        cmd = "mkdir -p {logdir} && ".format(logdir=logdir) + cmd
         cmd += "&> {logdir}/dask_scheduler_{addr}:{port}.log".format(
             addr=addr, port=port, logdir=logdir
         )
 
     # Format output labels we can prepend to each line of output, and create
     # a 'status' key to keep track of jobs that terminate prematurely.
-    label = f"{bcolors.BOLD}scheduler {addr}:{port}{bcolors.ENDC}"
+    label = (
+        bcolors.BOLD
+        + "scheduler {addr}:{port}".format(addr=addr, port=port)
+        + bcolors.ENDC
+    )
 
     # Create a command dictionary, which contains everything we need to run and
     # interact with this command.
@@ -254,7 +260,7 @@ def start_worker(
     scheduler_port,
     worker_addr,
     nthreads,
-    n_workers,
+    nprocs,
     ssh_username,
     ssh_port,
     ssh_private_key,
@@ -270,7 +276,7 @@ def start_worker(
     cmd = (
         "{python} -m {remote_dask_worker} "
         "{scheduler_addr}:{scheduler_port} "
-        "--nthreads {nthreads}" + (" --nworkers {n_workers}" if n_workers != 1 else "")
+        "--nthreads {nthreads}" + (" --nprocs {nprocs}" if nprocs != 1 else "")
     )
 
     if not nohost:
@@ -292,7 +298,7 @@ def start_worker(
         scheduler_port=scheduler_port,
         worker_addr=worker_addr,
         nthreads=nthreads,
-        n_workers=n_workers,
+        nprocs=nprocs,
         memory_limit=memory_limit,
         worker_port=worker_port,
         nanny_port=nanny_port,
@@ -305,12 +311,12 @@ def start_worker(
 
     # Optionally redirect stdout and stderr to a logfile
     if logdir is not None:
-        cmd = f"mkdir -p {logdir} && {cmd}"
+        cmd = "mkdir -p {logdir} && ".format(logdir=logdir) + cmd
         cmd += "&> {logdir}/dask_scheduler_{addr}.log".format(
             addr=worker_addr, logdir=logdir
         )
 
-    label = f"worker {worker_addr}"
+    label = "worker {addr}".format(addr=worker_addr)
 
     # Create a command dictionary, which contains everything we need to run and
     # interact with this command.
@@ -342,7 +348,7 @@ class SSHCluster:
         scheduler_port,
         worker_addrs,
         nthreads=0,
-        n_workers=None,
+        nprocs=1,
         ssh_username=None,
         ssh_port=22,
         ssh_private_key=None,
@@ -354,32 +360,12 @@ class SSHCluster:
         nanny_port=None,
         remote_dask_worker="distributed.cli.dask_worker",
         local_directory=None,
-        **kwargs,
     ):
 
         self.scheduler_addr = scheduler_addr
         self.scheduler_port = scheduler_port
         self.nthreads = nthreads
-        nprocs = kwargs.pop("nprocs", None)
-        if kwargs:
-            raise TypeError(
-                f"__init__() got an unexpected keyword argument {', '.join(kwargs.keys())}"
-            )
-        if nprocs is not None and n_workers is not None:
-            raise ValueError(
-                "Both nprocs and n_workers were specified. Use n_workers only."
-            )
-        elif nprocs is not None:
-            warnings.warn(
-                "The nprocs argument will be removed in a future release. It has been "
-                "renamed to n_workers.",
-                FutureWarning,
-            )
-            n_workers = nprocs
-        elif n_workers is None:
-            n_workers = 1
-
-        self.n_workers = n_workers
+        self.nprocs = nprocs
 
         self.ssh_username = ssh_username
         self.ssh_port = ssh_port
@@ -428,30 +414,12 @@ class SSHCluster:
 
         # Start worker nodes
         self.workers = []
-        for addr in worker_addrs:
+        for i, addr in enumerate(worker_addrs):
             self.add_worker(addr)
 
     @gen.coroutine
     def _start(self):
         pass
-
-    @property
-    def nprocs(self):
-        warnings.warn(
-            "The nprocs attribute will be removed in a future release. It has been "
-            "renamed to n_workers.",
-            FutureWarning,
-        )
-        return self.n_workers
-
-    @nprocs.setter
-    def nprocs(self, value):
-        warnings.warn(
-            "The nprocs attribute will be removed in a future release. It has been "
-            "renamed to n_workers.",
-            FutureWarning,
-        )
-        self.n_workers = value
 
     @property
     def scheduler_address(self):
@@ -470,7 +438,7 @@ class SSHCluster:
 
                 # Kill some time and free up CPU before starting the next sweep
                 # through the processes.
-                sleep(0.1)
+                time.sleep(0.1)
 
             # end while true
 
@@ -485,7 +453,7 @@ class SSHCluster:
                 self.scheduler_port,
                 address,
                 self.nthreads,
-                self.n_workers,
+                self.nprocs,
                 self.ssh_username,
                 self.ssh_port,
                 self.ssh_private_key,
@@ -509,5 +477,5 @@ class SSHCluster:
     def __enter__(self):
         return self
 
-    def __exit__(self, exc_type, exc_value, traceback):
+    def __exit__(self, *args):
         self.shutdown()

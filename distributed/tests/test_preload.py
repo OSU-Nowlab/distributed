@@ -1,21 +1,17 @@
-from __future__ import annotations
-
-import logging
 import os
-import re
+import pytest
 import shutil
 import sys
 import tempfile
-from textwrap import dedent
-from unittest import mock
-
 import pytest
 
-import dask
+from tornado import web
 
-from distributed import Client, Nanny, Scheduler, Worker
-from distributed.utils import open_port
-from distributed.utils_test import captured_logger, cluster, gen_cluster, gen_test
+import dask
+from distributed import Client, Scheduler, Worker, Nanny
+from distributed.utils_test import cluster, captured_logger
+from distributed.utils_test import loop, cleanup  # noqa F401
+
 
 PRELOAD_TEXT = """
 _worker_info = {}
@@ -51,20 +47,20 @@ def test_worker_preload_file(loop):
         shutil.rmtree(tmpdir)
 
 
-@gen_test()
-async def test_worker_preload_text():
+@pytest.mark.asyncio
+async def test_worker_preload_text(cleanup):
     text = """
 def dask_setup(worker):
     worker.foo = 'setup'
 """
-    async with Scheduler(dashboard_address=":0", preload=text) as s:
+    async with Scheduler(port=0, preload=text) as s:
         assert s.foo == "setup"
         async with Worker(s.address, preload=[text]) as w:
             assert w.foo == "setup"
 
 
-@gen_cluster(nthreads=[])
-async def test_worker_preload_config(s):
+@pytest.mark.asyncio
+async def test_worker_preload_config(cleanup):
     text = """
 def dask_setup(worker):
     worker.foo = 'setup'
@@ -73,14 +69,15 @@ def dask_teardown(worker):
     worker.foo = 'teardown'
 """
     with dask.config.set(
-        {"distributed.worker.preload": [text], "distributed.nanny.preload": [text]}
+        {"distributed.worker.preload": text, "distributed.nanny.preload": text}
     ):
-        async with Nanny(s.address) as w:
-            assert w.foo == "setup"
-            async with Client(s.address, asynchronous=True) as c:
-                d = await c.run(lambda dask_worker: dask_worker.foo)
-                assert d == {w.worker_address: "setup"}
-        assert w.foo == "teardown"
+        async with Scheduler(port=0) as s:
+            async with Nanny(s.address) as w:
+                assert w.foo == "setup"
+                async with Client(s.address, asynchronous=True) as c:
+                    d = await c.run(lambda dask_worker: dask_worker.foo)
+                    assert d == {w.worker_address: "setup"}
+            assert w.foo == "teardown"
 
 
 def test_worker_preload_module(loop):
@@ -109,37 +106,38 @@ def test_worker_preload_module(loop):
         shutil.rmtree(tmpdir)
 
 
-@gen_cluster(nthreads=[])
-async def test_worker_preload_click(s):
-    text = """
+@pytest.mark.asyncio
+async def test_worker_preload_click(cleanup, tmpdir):
+    CLICK_PRELOAD_TEXT = """
 import click
 
 @click.command()
 def dask_setup(worker):
     worker.foo = 'setup'
 """
+    async with Scheduler(port=0) as s:
+        async with Worker(s.address, preload=CLICK_PRELOAD_TEXT) as w:
+            assert w.foo == "setup"
 
-    async with Worker(s.address, preload=text) as w:
-        assert w.foo == "setup"
 
-
-@gen_cluster(nthreads=[])
-async def test_worker_preload_click_async(s, tmpdir):
+@pytest.mark.asyncio
+async def test_worker_preload_click_async(cleanup, tmpdir):
     # Ensure we allow for click commands wrapping coroutines
     # https://github.com/dask/distributed/issues/4169
-    text = """
+    CLICK_PRELOAD_TEXT = """
 import click
 
 @click.command()
 async def dask_setup(worker):
     worker.foo = 'setup'
 """
-    async with Worker(s.address, preload=text) as w:
-        assert w.foo == "setup"
+    async with Scheduler(port=0) as s:
+        async with Worker(s.address, preload=CLICK_PRELOAD_TEXT) as w:
+            assert w.foo == "setup"
 
 
-@gen_test()
-async def test_preload_import_time():
+@pytest.mark.asyncio
+async def test_preload_import_time(cleanup):
     text = """
 from distributed.comm.registry import backends
 from distributed.comm.tcp import TCPBackend
@@ -147,7 +145,7 @@ from distributed.comm.tcp import TCPBackend
 backends["foo"] = TCPBackend()
 """.strip()
     try:
-        async with Scheduler(dashboard_address=":0", preload=text, protocol="foo") as s:
+        async with Scheduler(port=0, preload=text, protocol="foo") as s:
             async with Nanny(s.address, preload=text, protocol="foo") as n:
                 async with Client(s.address, asynchronous=True) as c:
                     await c.wait_for_workers(1)
@@ -157,177 +155,23 @@ backends["foo"] = TCPBackend()
         del backends["foo"]
 
 
-@gen_test()
-async def test_web_preload():
-    with mock.patch(
-        "urllib3.PoolManager.request",
-        **{
-            "return_value.data": b"def dask_setup(dask_server):"
-            b"\n    dask_server.foo = 1"
-            b"\n"
-        },
-    ) as request, captured_logger("distributed.preloading") as log:
-        async with Scheduler(
-            host="localhost", preload=["http://example.com/preload"]
-        ) as s:
-            assert s.foo == 1
-        assert (
-            re.match(
-                r"(?s).*Downloading preload at http://example.com/preload\n"
-                r".*Run preload setup: http://example.com/preload\n"
-                r".*",
-                log.getvalue(),
+@pytest.mark.asyncio
+async def test_web_preload(cleanup):
+    class MyHandler(web.RequestHandler):
+        def get(self):
+            self.write(
+                """
+def dask_setup(dask_server):
+    dask_server.foo = 1
+""".strip()
             )
-            is not None
-        )
-    assert request.mock_calls == [
-        mock.call(method="GET", url="http://example.com/preload", retries=mock.ANY)
-    ]
 
-
-@gen_cluster(nthreads=[])
-async def test_scheduler_startup(s):
-    text = f"""
-import dask
-dask.config.set(scheduler_address="{s.address}")
-"""
-    async with Worker(preload=text) as w:
-        assert w.scheduler.address == s.address
-
-
-@gen_cluster(nthreads=[])
-async def test_scheduler_startup_nanny(s):
-    text = f"""
-import dask
-dask.config.set(scheduler_address="{s.address}")
-"""
-    async with Nanny(preload_nanny=text) as w:
-        assert w.scheduler.address == s.address
-
-
-@gen_test()
-async def test_web_preload_worker():
-    port = open_port()
-    data = dedent(
-        f"""\
-        import dask
-        dask.config.set(scheduler_address="tcp://127.0.0.1:{port}")
-        """
-    ).encode()
-    with mock.patch(
-        "urllib3.PoolManager.request",
-        **{"return_value.data": data},
-    ) as request:
-        async with Scheduler(port=port, host="localhost") as s:
-            async with Nanny(preload_nanny=["http://example.com/preload"]) as nanny:
-                assert nanny.scheduler_addr == s.address
-    assert request.mock_calls == [
-        mock.call(method="GET", url="http://example.com/preload", retries=mock.ANY)
-    ]
-
-
-# This test is blocked on https://github.com/dask/distributed/issues/5819
-@pytest.mark.xfail(
-    reason="The preload argument to the client isn't supported yet", strict=True
-)
-@gen_cluster(nthreads=[])
-async def test_client_preload_text(s):
-    text = dedent(
-        """\
-        def dask_setup(client):
-            client.foo = "setup"
-
-
-        def dask_teardown(client):
-            client.foo = "teardown"
-        """
-    )
-    async with Client(address=s.address, asynchronous=True, preload=text) as c:
-        assert c.foo == "setup"
-    assert c.foo == "teardown"
-
-
-@gen_cluster(nthreads=[])
-async def test_client_preload_config(s):
-    text = dedent(
-        """\
-        def dask_setup(client):
-            client.foo = "setup"
-
-
-        def dask_teardown(client):
-            client.foo = "teardown"
-        """
-    )
-    with dask.config.set({"distributed.client.preload": [text]}):
-        async with Client(address=s.address, asynchronous=True) as c:
-            assert c.foo == "setup"
-        assert c.foo == "teardown"
-
-
-# This test is blocked on https://github.com/dask/distributed/issues/5819
-@pytest.mark.xfail(
-    reason="The preload argument to the client isn't supported yet", strict=True
-)
-@gen_cluster(nthreads=[])
-async def test_client_preload_click(s):
-    text = dedent(
-        """\
-        import click
-
-        @click.command()
-        @click.argument("value")
-        def dask_setup(client, value):
-            client.foo = value
-        """
-    )
-    value = "setup"
-    async with Client(
-        address=s.address, asynchronous=True, preload=text, preload_argv=[[value]]
-    ) as c:
-        assert c.foo == value
-
-
-@gen_test()
-async def test_failure_doesnt_crash():
-    text = """
-def dask_setup(worker):
-    raise Exception(123)
-
-def dask_teardown(worker):
-    raise Exception(456)
-"""
-
-    with captured_logger(logging.getLogger("distributed.scheduler")) as s_logger:
-        with captured_logger(logging.getLogger("distributed.worker")) as w_logger:
-            async with Scheduler(dashboard_address=":0", preload=text) as s:
-                async with Worker(s.address, preload=[text]) as w:
-                    pass
-
-    assert "123" in s_logger.getvalue()
-    assert "123" in w_logger.getvalue()
-    assert "456" in s_logger.getvalue()
-    assert "456" in w_logger.getvalue()
-
-
-@gen_cluster(nthreads=[])
-async def test_client_preload_config_click(s):
-    text = dedent(
-        """\
-        import click
-
-        @click.command()
-        @click.argument("value")
-        def dask_setup(client, value):
-            client.foo = value
-        """
-    )
-    value = "setup"
-    with dask.config.set(
-        {
-            "distributed.client.preload": [text],
-            "distributed.client.preload-argv": [[value]],
-        }
-    ):
-        async with Client(address=s.address, asynchronous=True) as c:
-            assert c.foo == value
+    app = web.Application([(r"/preload", MyHandler)])
+    server = app.listen(12345)
+    try:
+        with captured_logger("distributed.preloading") as log:
+            async with Scheduler(preload=["http://localhost:12345/preload"]) as s:
+                assert s.foo == 1
+        assert "12345/preload" in log.getvalue()
+    finally:
+        server.stop()

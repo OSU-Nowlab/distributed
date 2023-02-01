@@ -1,12 +1,12 @@
-from __future__ import annotations
-
 import importlib
 import os
+from typing import List
 
-import toolz
 from tornado import web
+import toolz
 
-from distributed.utils import has_keyword
+from ..utils import has_keyword
+
 
 dirname = os.path.dirname(__file__)
 
@@ -28,7 +28,7 @@ def redirect(path):
     return Redirect
 
 
-def get_handlers(server, modules: list[str], prefix="/"):  # type: ignore[no-untyped-def]
+def get_handlers(server, modules: List[str], prefix="/"):
     prefix = prefix or ""
     prefix = "/" + prefix.strip("/")
 

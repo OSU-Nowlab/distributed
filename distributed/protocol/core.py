@@ -1,164 +1,224 @@
-from __future__ import annotations
-
+from functools import reduce
 import logging
+import operator
 
 import msgpack
 
-import dask.config
-
-from distributed.protocol import pickle
-from distributed.protocol.compression import decompress, maybe_compress
-from distributed.protocol.serialize import (
-    Pickled,
+from .compression import compressions, maybe_compress, decompress
+from .serialize import (
+    serialize,
+    deserialize,
     Serialize,
     Serialized,
-    ToPickle,
-    merge_and_deserialize,
+    extract_serialize,
     msgpack_decode_default,
     msgpack_encode_default,
-    serialize_and_split,
 )
-from distributed.protocol.utils import msgpack_opts
-from distributed.utils import ensure_memoryview
+from .utils import frame_split_size, merge_frames, msgpack_opts
+from ..utils import is_writeable, nbytes
+
+_deserialize = deserialize
+
 
 logger = logging.getLogger(__name__)
 
 
-def dumps(  # type: ignore[no-untyped-def]
-    msg, serializers=None, on_error="message", context=None, frame_split_size=None
-) -> list:
-    """Transform Python message to bytestream suitable for communication
-
-    Developer Notes
-    ---------------
-    The approach here is to use `msgpack.dumps()` to serialize `msg` and
-    write the result to the first output frame. If `msgpack.dumps()`
-    encounters an object it cannot serialize like a NumPy array, it is handled
-    out-of-band by `_encode_default()` and appended to the output frame list.
-    """
+def dumps(msg, serializers=None, on_error="message", context=None):
+    """ Transform Python message to bytestream suitable for communication """
     try:
+        data = {}
+
         if context and "compression" in context:
             compress_opts = {"compression": context["compression"]}
         else:
             compress_opts = {}
 
-        def _inplace_compress_frames(header, frames):
-            compression = list(header.get("compression", [None] * len(frames)))
+        # Only lists and dicts can contain serialized values
+        if isinstance(msg, (list, dict)):
+            msg, data, bytestrings = extract_serialize(msg)
+        small_header, small_payload = dumps_msgpack(msg, **compress_opts)
 
-            for i in range(len(frames)):
-                if compression[i] is None:
-                    compression[i], frames[i] = maybe_compress(
-                        frames[i], **compress_opts
-                    )
+        if not data:  # fast path without serialized data
+            return small_header, small_payload
 
-            header["compression"] = tuple(compression)
+        pre = {
+            key: (value.header, value.frames)
+            for key, value in data.items()
+            if type(value) is Serialized
+        }
 
-        def create_serialized_sub_frames(obj: Serialized | Serialize) -> list:
-            if isinstance(obj, Serialized):
-                sub_header, sub_frames = obj.header, obj.frames
-            else:
-                sub_header, sub_frames = serialize_and_split(
-                    obj,
-                    serializers=serializers,
-                    on_error=on_error,
-                    context=context,
-                    size=frame_split_size,
-                )
-                _inplace_compress_frames(sub_header, sub_frames)
-            sub_header["num-sub-frames"] = len(sub_frames)
-            sub_header = msgpack.dumps(
-                sub_header, default=msgpack_encode_default, use_bin_type=True
+        data = {
+            key: serialize(
+                value.data, serializers=serializers, on_error=on_error, context=context
             )
-            return [sub_header] + sub_frames
+            for key, value in data.items()
+            if type(value) is Serialize
+        }
 
-        def create_pickled_sub_frames(obj: Pickled | ToPickle) -> list:
-            if isinstance(obj, Pickled):
-                sub_header, sub_frames = obj.header, obj.frames
-            else:
-                sub_frames = []
-                sub_header = {
-                    "pickled-obj": pickle.dumps(
-                        obj.data,
-                        # In to support len() and slicing, we convert `PickleBuffer`
-                        # objects to memoryviews of bytes.
-                        buffer_callback=lambda x: sub_frames.append(
-                            ensure_memoryview(x)
-                        ),
+        header = {"headers": {}, "keys": [], "bytestrings": list(bytestrings)}
+
+        out_frames = []
+
+        for key, (head, frames) in data.items():
+            if "writeable" not in head:
+                head["writeable"] = tuple(map(is_writeable, frames))
+            if "lengths" not in head:
+                head["lengths"] = tuple(map(nbytes, frames))
+
+            # Compress frames that are not yet compressed
+            out_compression = []
+            _out_frames = []
+            for frame, compression in zip(
+                frames, head.get("compression") or [None] * len(frames)
+            ):
+                if compression is None:  # default behavior
+                    _frames = frame_split_size(frame)
+                    _compression, _frames = zip(
+                        *[maybe_compress(frame, **compress_opts) for frame in _frames]
                     )
-                }
-                _inplace_compress_frames(sub_header, sub_frames)
+                    out_compression.extend(_compression)
+                    _out_frames.extend(_frames)
+                else:  # already specified, so pass
+                    out_compression.append(compression)
+                    _out_frames.append(frame)
 
-            sub_header["num-sub-frames"] = len(sub_frames)
-            sub_header = msgpack.dumps(sub_header)
-            return [sub_header] + sub_frames
+            head["compression"] = out_compression
+            head["count"] = len(_out_frames)
+            header["headers"][key] = head
+            header["keys"].append(key)
+            out_frames.extend(_out_frames)
 
-        frames = [None]
+        for key, (head, frames) in pre.items():
+            if "writeable" not in head:
+                head["writeable"] = tuple(map(is_writeable, frames))
+            if "lengths" not in head:
+                head["lengths"] = tuple(map(nbytes, frames))
+            head["count"] = len(frames)
+            header["headers"][key] = head
+            header["keys"].append(key)
+            out_frames.extend(frames)
 
-        def _encode_default(obj):
-            if isinstance(obj, (Serialize, Serialized)):
-                offset = len(frames)
-                frames.extend(create_serialized_sub_frames(obj))
-                return {"__Serialized__": offset}
-            elif isinstance(obj, (ToPickle, Pickled)):
-                offset = len(frames)
-                frames.extend(create_pickled_sub_frames(obj))
-                return {"__Pickled__": offset}
-            else:
-                return msgpack_encode_default(obj)
+        for i, frame in enumerate(out_frames):
+            if type(frame) is memoryview and frame.strides != (1,):
+                try:
+                    frame = frame.cast("B")
+                except TypeError:
+                    frame = frame.tobytes()
+                out_frames[i] = frame
 
-        frames[0] = msgpack.dumps(msg, default=_encode_default, use_bin_type=True)
-        return frames
-
+        return [
+            small_header,
+            small_payload,
+            msgpack.dumps(header, use_bin_type=True),
+        ] + out_frames
     except Exception:
         logger.critical("Failed to Serialize", exc_info=True)
         raise
 
 
 def loads(frames, deserialize=True, deserializers=None):
-    """Transform bytestream back into Python value"""
-
-    allow_pickle = dask.config.get("distributed.scheduler.pickle")
-
+    """ Transform bytestream back into Python value """
+    frames = frames[::-1]  # reverse order to improve pop efficiency
+    if not isinstance(frames, list):
+        frames = list(frames)
     try:
+        small_header = frames.pop()
+        small_payload = frames.pop()
+        msg = loads_msgpack(small_header, small_payload)
+        if not frames:
+            return msg
 
-        def _decode_default(obj):
-            offset = obj.get("__Serialized__", 0)
-            if offset > 0:
-                sub_header = msgpack.loads(
-                    frames[offset],
-                    object_hook=msgpack_decode_default,
-                    use_list=False,
-                    **msgpack_opts,
-                )
-                offset += 1
-                sub_frames = frames[offset : offset + sub_header["num-sub-frames"]]
-                if deserialize:
-                    if "compression" in sub_header:
-                        sub_frames = decompress(sub_header, sub_frames)
-                    return merge_and_deserialize(
-                        sub_header, sub_frames, deserializers=deserializers
-                    )
+        header = frames.pop()
+        header = msgpack.loads(header, use_list=False, **msgpack_opts)
+        keys = header["keys"]
+        headers = header["headers"]
+        bytestrings = set(header["bytestrings"])
+
+        for key in keys:
+            head = headers[key]
+            count = head["count"]
+            if count:
+                fs = frames[-count::][::-1]
+                del frames[-count:]
+            else:
+                fs = []
+
+            if deserialize or key in bytestrings:
+                if "compression" in head:
+                    fs = decompress(head, fs)
+                if not any(hasattr(f, "__cuda_array_interface__") for f in fs):
+                    fs = merge_frames(head, fs)
+                value = _deserialize(head, fs, deserializers=deserializers)
+            else:
+                value = Serialized(head, fs)
+
+            def put_in(keys, coll, val):
+                """Inverse of get_in, but does type promotion in the case of lists"""
+                if keys:
+                    holder = reduce(operator.getitem, keys[:-1], coll)
+                    if isinstance(holder, tuple):
+                        holder = list(holder)
+                        coll = put_in(keys[:-1], coll, holder)
+                    holder[keys[-1]] = val
                 else:
-                    return Serialized(sub_header, sub_frames)
+                    coll = val
+                return coll
 
-            offset = obj.get("__Pickled__", 0)
-            if offset > 0:
-                sub_header = msgpack.loads(frames[offset])
-                offset += 1
-                sub_frames = frames[offset : offset + sub_header["num-sub-frames"]]
-                if allow_pickle:
-                    return pickle.loads(sub_header["pickled-obj"], buffers=sub_frames)
-                else:
-                    raise ValueError(
-                        "Unpickle on the Scheduler isn't allowed, set `distributed.scheduler.pickle=true`"
-                    )
+            msg = put_in(key, msg, value)
 
-            return msgpack_decode_default(obj)
-
-        return msgpack.loads(
-            frames[0], object_hook=_decode_default, use_list=False, **msgpack_opts
-        )
-
+        return msg
     except Exception:
         logger.critical("Failed to deserialize", exc_info=True)
         raise
+
+
+def dumps_msgpack(msg, compression=None):
+    """Dump msg into header and payload, both bytestrings
+
+    All of the message must be msgpack encodable
+
+    See Also:
+        loads_msgpack
+    """
+    header = {}
+    payload = msgpack.dumps(msg, default=msgpack_encode_default, use_bin_type=True)
+
+    fmt, payload = maybe_compress(payload, compression=compression)
+    if fmt:
+        header["compression"] = fmt
+
+    if header:
+        header_bytes = msgpack.dumps(header, use_bin_type=True)
+    else:
+        header_bytes = b""
+
+    return [header_bytes, payload]
+
+
+def loads_msgpack(header, payload):
+    """Read msgpack header and payload back to Python object
+
+    See Also:
+        dumps_msgpack
+    """
+    header = bytes(header)
+    if header:
+        header = msgpack.loads(
+            header, object_hook=msgpack_decode_default, use_list=False, **msgpack_opts
+        )
+    else:
+        header = {}
+
+    if header.get("compression"):
+        try:
+            decompress = compressions[header["compression"]]["decompress"]
+            payload = decompress(payload)
+        except KeyError:
+            raise ValueError(
+                "Data is compressed as %s but we don't have this"
+                " installed" % str(header["compression"])
+            )
+
+    return msgpack.loads(
+        payload, object_hook=msgpack_decode_default, use_list=False, **msgpack_opts
+    )

@@ -1,20 +1,21 @@
-from __future__ import annotations
-
 import asyncio
+from collections import deque, namedtuple
 import itertools
 import logging
 import os
 import threading
 import weakref
-from collections import deque, namedtuple
+import warnings
 
 from tornado.concurrent import Future
 from tornado.ioloop import IOLoop
 
-from distributed.comm.core import Comm, CommClosedError, Connector, Listener
-from distributed.comm.registry import Backend, backends
-from distributed.protocol import nested_deserialize
-from distributed.utils import get_ip
+from ..protocol import nested_deserialize
+from ..utils import get_ip
+
+from .registry import Backend, backends
+from .core import Comm, Connector, Listener, CommClosedError
+
 
 logger = logging.getLogger(__name__)
 
@@ -31,22 +32,20 @@ class Manager:
     def __init__(self):
         self.listeners = weakref.WeakValueDictionary()
         self.addr_suffixes = itertools.count(1)
-        self._ip = None
-        self.lock = threading.Lock()
-
-    @property
-    def ip(self):
-        if not self._ip:
+        with warnings.catch_warnings():
+            # Avoid immediate warning for unreachable network
+            # (will still warn for other get_ip() calls when actually used)
+            warnings.simplefilter("ignore")
             try:
-                self._ip = get_ip()
+                self.ip = get_ip()
             except OSError:
-                self._ip = "127.0.0.1"
-        return self._ip
+                self.ip = "127.0.0.1"
+        self.lock = threading.Lock()
 
     def add_listener(self, addr, listener):
         with self.lock:
             if addr in self.listeners:
-                raise RuntimeError(f"already listening on {addr!r}")
+                raise RuntimeError("already listening on %r" % (addr,))
             self.listeners[addr] = listener
 
     def remove_listener(self, addr):
@@ -90,13 +89,6 @@ class QueueEmpty(Exception):
     pass
 
 
-def _set_result_unless_cancelled(fut, result):
-    """Helper setting the result only if the future was not cancelled."""
-    if fut.cancelled():
-        return
-    fut.set_result(result)
-
-
 class Queue:
     """
     A single-reader, single-writer, non-threadsafe, peekable queue.
@@ -128,7 +120,7 @@ class Queue:
         if fut is not None:
             assert len(q) == 0
             self._read_future = None
-            _set_result_unless_cancelled(fut, value)
+            fut.set_result(value)
         else:
             q.append(value)
 
@@ -162,18 +154,13 @@ class InProc(Comm):
 
     _initialized = False
 
-    def __init__(  # type: ignore[no-untyped-def]
-        self,
-        local_addr: str,
-        peer_addr: str,
-        read_q,
-        write_q,
-        write_loop,
-        deserialize: bool = True,
+    def __init__(
+        self, local_addr, peer_addr, read_q, write_q, write_loop, deserialize=True
     ):
-        super().__init__(deserialize=deserialize)
+        Comm.__init__(self)
         self._local_addr = local_addr
         self._peer_addr = peer_addr
+        self.deserialize = deserialize
         self._read_q = read_q
         self._write_q = write_q
         self._write_loop = write_loop
@@ -184,31 +171,29 @@ class InProc(Comm):
         self._initialized = True
 
     def _get_finalizer(self):
-        r = repr(self)
-
-        def finalize(write_q=self._write_q, write_loop=self._write_loop, r=r):
-            logger.warning(f"Closing dangling queue in {r}")
+        def finalize(write_q=self._write_q, write_loop=self._write_loop, r=repr(self)):
+            logger.warning("Closing dangling queue in %s" % (r,))
             write_loop.add_callback(write_q.put_nowait, _EOF)
 
         return finalize
 
     @property
-    def local_address(self) -> str:
+    def local_address(self):
         return self._local_addr
 
     @property
-    def peer_address(self) -> str:
+    def peer_address(self):
         return self._peer_addr
 
     async def read(self, deserializers="ignored"):
         if self._closed:
-            raise CommClosedError()
+            raise CommClosedError
 
         msg = await self._read_q.get()
         if msg is _EOF:
             self._closed = True
             self._finalizer.detach()
-            raise CommClosedError()
+            raise CommClosedError
 
         if self.deserialize:
             msg = nested_deserialize(msg)
@@ -216,7 +201,7 @@ class InProc(Comm):
 
     async def write(self, msg, serializers=None, on_error=None):
         if self.closed():
-            raise CommClosedError()
+            raise CommClosedError
 
         # Ensure we feed the queue in the same thread it is read from.
         self._write_loop.add_callback(self._write_q.put_nowait, msg)
@@ -263,14 +248,6 @@ class InProcListener(Listener):
         self.deserialize = deserialize
         self.listen_q = Queue()
 
-    async def _handle_stream(self, comm):
-        try:
-            await self.on_connection(comm)
-        except CommClosedError:
-            logger.debug("Connection closed before handshake completed")
-            return
-        await self.comm_handler(comm)
-
     async def _listen(self):
         while True:
             conn_req = await self.listen_q.get()
@@ -286,7 +263,12 @@ class InProcListener(Listener):
             )
             # Notify connector
             conn_req.c_loop.add_callback(conn_req.conn_event.set)
-            IOLoop.current().add_callback(self._handle_stream, comm)
+            try:
+                await self.on_connection(comm)
+            except CommClosedError:
+                logger.debug("Connection closed before handshake completed")
+                return
+            IOLoop.current().add_callback(self.comm_handler, comm)
 
     def connect_threadsafe(self, conn_req):
         self.loop.add_callback(self.listen_q.put_nowait, conn_req)
@@ -316,7 +298,7 @@ class InProcConnector(Connector):
     async def connect(self, address, deserialize=True, **connection_args):
         listener = self.manager.get_listener_for(address)
         if listener is None:
-            raise OSError(f"no endpoint for inproc address {address!r}")
+            raise IOError("no endpoint for inproc address %r" % (address,))
 
         conn_req = ConnectionRequest(
             c2s_q=Queue(),

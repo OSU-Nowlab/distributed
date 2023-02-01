@@ -1,22 +1,25 @@
-from __future__ import annotations
-
 import asyncio
-import json
-import sys
-
 import click
+import json
+import os
+import sys
 import yaml
 
+import dask.config
 from distributed.deploy.spec import run_spec
+from distributed.utils import deserialize_for_cli
 
 
-@click.command(name="spec", context_settings=dict(ignore_unknown_options=True))
+@click.command(context_settings=dict(ignore_unknown_options=True))
 @click.argument("args", nargs=-1)
 @click.option("--spec", type=str, default="", help="")
 @click.option("--spec-file", type=str, default=None, help="")
 @click.version_option()
-def main(args: list, spec: str, spec_file: str) -> None:
-    """Launch a Dask process defined by a JSON/YAML specification"""
+def main(args, spec: str, spec_file: str):
+
+    if "DASK_INTERNAL_INHERIT_CONFIG" in os.environ:
+        config = deserialize_for_cli(os.environ["DASK_INTERNAL_INHERIT_CONFIG"])
+        dask.config.update(dask.config.global_config, config)
 
     if spec and spec_file or not spec and not spec_file:
         print("Must specify exactly one of --spec and --spec-file")
@@ -35,11 +38,11 @@ def main(args: list, spec: str, spec_file: str) -> None:
     async def run():
         servers = await run_spec(_spec, *args)
         try:
-            await asyncio.gather(*(w.finished() for w in servers.values()))
+            await asyncio.gather(*[w.finished() for w in servers.values()])
         except KeyboardInterrupt:
-            await asyncio.gather(*(w.close() for w in servers.values()))
+            await asyncio.gather(*[w.close() for w in servers.values()])
 
-    asyncio.run(run())
+    asyncio.get_event_loop().run_until_complete(run())
 
 
 if __name__ == "__main__":

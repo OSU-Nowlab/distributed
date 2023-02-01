@@ -1,23 +1,20 @@
-from __future__ import annotations
-
 import asyncio
+from collections import defaultdict, deque
+from contextlib import suppress
 import logging
 import threading
 import weakref
-from collections import defaultdict, deque
 
-from dask.utils import parse_timedelta
-
-from distributed.core import CommClosedError
-from distributed.metrics import time
-from distributed.protocol.serialize import to_serialize
-from distributed.utils import TimeoutError, sync
+from .core import CommClosedError
+from .metrics import time
+from .utils import sync, TimeoutError, parse_timedelta
+from .protocol.serialize import to_serialize
 
 logger = logging.getLogger(__name__)
 
 
 class PubSubSchedulerExtension:
-    """Extend Dask's scheduler with routes to handle PubSub machinery"""
+    """ Extend Dask's scheduler with routes to handle PubSub machinery """
 
     def __init__(self, scheduler):
         self.scheduler = scheduler
@@ -36,7 +33,9 @@ class PubSubSchedulerExtension:
             }
         )
 
-    def add_publisher(self, name=None, worker=None):
+        self.scheduler.extensions["pubsub"] = self
+
+    def add_publisher(self, comm=None, name=None, worker=None):
         logger.debug("Add publisher: %s %s", name, worker)
         self.publishers[name].add(worker)
         return {
@@ -45,7 +44,7 @@ class PubSubSchedulerExtension:
             and len(self.client_subscribers[name]) > 0,
         }
 
-    def add_subscriber(self, name=None, worker=None, client=None):
+    def add_subscriber(self, comm=None, name=None, worker=None, client=None):
         if worker:
             logger.debug("Add worker subscriber: %s %s", name, worker)
             self.subscribers[name].add(worker)
@@ -63,7 +62,7 @@ class PubSubSchedulerExtension:
                 )
             self.client_subscribers[name].add(client)
 
-    def remove_publisher(self, name=None, worker=None):
+    def remove_publisher(self, comm=None, name=None, worker=None):
         if worker in self.publishers[name]:
             logger.debug("Remove publisher: %s %s", name, worker)
             self.publishers[name].remove(worker)
@@ -72,7 +71,7 @@ class PubSubSchedulerExtension:
                 del self.subscribers[name]
                 del self.publishers[name]
 
-    def remove_subscriber(self, name=None, worker=None, client=None):
+    def remove_subscriber(self, comm=None, name=None, worker=None, client=None):
         if worker:
             logger.debug("Remove worker subscriber: %s %s", name, worker)
             self.subscribers[name].remove(worker)
@@ -118,7 +117,7 @@ class PubSubSchedulerExtension:
 
 
 class PubSubWorkerExtension:
-    """Extend Dask's Worker with routes to handle PubSub machinery"""
+    """ Extend Dask's Worker with routes to handle PubSub machinery """
 
     def __init__(self, worker):
         self.worker = worker
@@ -171,13 +170,14 @@ class PubSubWorkerExtension:
 
 
 class PubSubClientExtension:
-    """Extend Dask's Client with handlers to handle PubSub machinery"""
+    """ Extend Dask's Client with handlers to handle PubSub machinery """
 
     def __init__(self, client):
         self.client = client
         self.client._stream_handlers.update({"pubsub-msg": self.handle_message})
 
         self.subscribers = defaultdict(weakref.WeakSet)
+        self.client.extensions["pubsub"] = self  # TODO: circular reference
 
     async def handle_message(self, name=None, msg=None):
         for sub in self.subscribers[name]:
@@ -284,7 +284,7 @@ class Pub:
 
     def __init__(self, name, worker=None, client=None):
         if worker is None and client is None:
-            from distributed import get_client, get_worker
+            from distributed import get_worker, get_client
 
             try:
                 worker = get_worker()
@@ -345,11 +345,11 @@ class Pub:
             self.client.scheduler_comm.send(data)
 
     def put(self, msg):
-        """Publish a message to all subscribers of this topic"""
+        """ Publish a message to all subscribers of this topic """
         self.loop.add_callback(self._put, msg)
 
     def __repr__(self):
-        return f"<Pub: {self.name}>"
+        return "<Pub: {}>".format(self.name)
 
     __str__ = __repr__
 
@@ -364,7 +364,7 @@ class Sub:
 
     def __init__(self, name, worker=None, client=None):
         if worker is None and client is None:
-            from distributed.worker import get_client, get_worker
+            from distributed.worker import get_worker, get_client
 
             try:
                 worker = get_worker()
@@ -421,7 +421,8 @@ class Sub:
             try:
                 await asyncio.wait_for(_(), timeout2)
             finally:
-                self.condition.release()
+                with suppress(RuntimeError):  # Python 3.6 fails here sometimes
+                    self.condition.release()
 
         return self.buffer.popleft()
 
@@ -432,7 +433,7 @@ class Sub:
 
         Parameters
         ----------
-        timeout : number or string or timedelta, optional
+        timeout: number or string or timedelta, optional
             Time in seconds to wait before timing out.
             Instead of number of seconds, it is also possible to specify
             a timedelta in string format, e.g. "200ms".
@@ -461,6 +462,6 @@ class Sub:
             self.condition.notify()
 
     def __repr__(self):
-        return f"<Sub: {self.name}>"
+        return "<Sub: {}>".format(self.name)
 
     __str__ = __repr__

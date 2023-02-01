@@ -1,13 +1,6 @@
-from __future__ import annotations
+from .serialize import dask_serialize, dask_deserialize, serialize, deserialize
 
 import sparse
-
-from distributed.protocol.serialize import (
-    dask_deserialize,
-    dask_serialize,
-    deserialize,
-    serialize,
-)
 
 
 @dask_serialize.register(sparse.COO)

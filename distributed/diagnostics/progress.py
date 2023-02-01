@@ -1,18 +1,14 @@
-from __future__ import annotations
-
 import asyncio
-import logging
 from collections import defaultdict
+import logging
 from timeit import default_timer
-from typing import ClassVar
 
 from tlz import groupby, valmap
 
-from dask.base import tokenize
-from dask.utils import key_split, stringify
+from dask.utils import stringify
+from .plugin import SchedulerPlugin
+from ..utils import key_split, key_split_group, log_errors
 
-from distributed.diagnostics.plugin import SchedulerPlugin
-from distributed.metrics import time
 
 logger = logging.getLogger(__name__)
 
@@ -64,8 +60,7 @@ class Progress(SchedulerPlugin):
     notably TextProgressBar and ProgressWidget, which do perform visualization.
     """
 
-    def __init__(self, keys, scheduler, minimum=0, dt=0.1, complete=False, name=None):
-        self.name = name or f"progress-{tokenize(keys, minimum, dt, complete)}"
+    def __init__(self, keys, scheduler, minimum=0, dt=0.1, complete=False):
         self.keys = {k.key if hasattr(k, "key") else k for k in keys}
         self.keys = {stringify(k) for k in self.keys}
         self.scheduler = scheduler
@@ -125,13 +120,11 @@ class Progress(SchedulerPlugin):
         self.stop()
 
     def stop(self, exception=None, key=None):
-        if self.name in self.scheduler.plugins:
-            self.scheduler.remove_plugin(name=self.name)
+        if self in self.scheduler.plugins:
+            self.scheduler.plugins.remove(self)
         if exception:
             self.status = "error"
-            self.extra.update(
-                {"exception": self.scheduler.tasks[key].exception, "key": key}
-            )
+            self.extra.update({"exception": self.scheduler.exceptions[key], "key": key})
         else:
             self.status = "finished"
         logger.debug("Remove Progress plugin")
@@ -164,9 +157,8 @@ class MultiProgress(Progress):
         self, keys, scheduler=None, func=key_split, minimum=0, dt=0.1, complete=False
     ):
         self.func = func
-        name = f"multi-progress-{tokenize(keys, func, minimum, dt, complete)}"
-        super().__init__(
-            keys, scheduler, minimum=minimum, dt=dt, complete=complete, name=name
+        Progress.__init__(
+            self, keys, scheduler, minimum=minimum, dt=dt, complete=complete
         )
 
     async def setup(self):
@@ -237,17 +229,15 @@ def format_time(t):
     m, s = divmod(t, 60)
     h, m = divmod(m, 60)
     if h:
-        return f"{h:2.0f}hr {m:2.0f}min {s:4.1f}s"
+        return "{0:2.0f}hr {1:2.0f}min {2:4.1f}s".format(h, m, s)
     elif m:
-        return f"{m:2.0f}min {s:4.1f}s"
+        return "{0:2.0f}min {1:4.1f}s".format(m, s)
     else:
-        return f"{s:4.1f}s"
+        return "{0:4.1f}s".format(s)
 
 
 class AllProgress(SchedulerPlugin):
-    """Keep track of all keys, grouped by key_split"""
-
-    name = "all-progress"
+    """ Keep track of all keys, grouped by key_split """
 
     def __init__(self, scheduler):
         self.all = defaultdict(set)
@@ -296,84 +286,76 @@ class AllProgress(SchedulerPlugin):
         self.state.clear()
 
 
-class GroupTiming(SchedulerPlugin):
-    """Keep track of high-level timing information for task group progress"""
-
-    name: ClassVar[str] = "group-timing"
-    time: list[float]
-    compute: dict[str, list[float]]
-    nthreads: list[float]
+class GroupProgress(SchedulerPlugin):
+    """ Keep track of all keys, grouped by key_split """
 
     def __init__(self, scheduler):
         self.scheduler = scheduler
+        self.keys = dict()
+        self.groups = dict()
+        self.nbytes = dict()
+        self.durations = dict()
+        self.dependencies = defaultdict(set)
+        self.dependents = defaultdict(set)
 
-        # Time bin size (in seconds). TODO: make this configurable?
-        self.dt = 1.0
+        for key, ts in self.scheduler.tasks.items():
+            k = key_split_group(key)
+            if k not in self.groups:
+                self.create(key, k)
+            self.keys[k].add(key)
+            self.groups[k][ts.state] += 1
+            if ts.state == "memory" and ts.nbytes >= 0:
+                self.nbytes[k] += ts.nbytes
 
-        # Initialize our data structures.
-        self._init()
+        scheduler.add_plugin(self)
 
-    def _init(self) -> None:
-        """Shared initializatoin code between __init__ and restart"""
-        now = time()
-
-        # Timestamps for tracking compute durations by task group.
-        # Start with length 2 so that we always can compute a valid dt later.
-        self.time = [now] * 2
-        # The amount of compute since the last timestamp
-        self.compute = {}
-        # The number of threads at the time
-        self.nthreads = [self.scheduler.total_nthreads] * 2
+    def create(self, key, k):
+        with log_errors():
+            ts = self.scheduler.tasks[key]
+            g = {"memory": 0, "erred": 0, "waiting": 0, "released": 0, "processing": 0}
+            self.keys[k] = set()
+            self.groups[k] = g
+            self.nbytes[k] = 0
+            self.durations[k] = 0
+            self.dependents[k] = {key_split_group(dts.key) for dts in ts.dependents}
+            for dts in ts.dependencies:
+                d = key_split_group(dts.key)
+                self.dependents[d].add(k)
+                self.dependencies[k].add(d)
 
     def transition(self, key, start, finish, *args, **kwargs):
-        # We are mostly interested in when tasks complete for now, so just look
-        # for when processing transitions to memory. Later we could also extend
-        # this if we can come up with useful visual channels to show it in.
-        if start == "processing" and finish == "memory":
-            startstops = kwargs.get("startstops")
-            if not startstops:
-                logger.warning(
-                    f"Task {key} finished processing, but timing information seems to "
-                    "be missing"
-                )
-                return
+        with log_errors():
+            ts = self.scheduler.tasks[key]
+            k = key_split_group(key)
+            if k not in self.groups:
+                self.create(key, k)
 
-            # Possibly extend the timeseries if another dt has passed
-            now = time()
-            self.time[-1] = now
-            while self.time[-1] - self.time[-2] > self.dt:
-                self.time[-1] = self.time[-2] + self.dt
-                self.time.append(now)
-                self.nthreads.append(self.scheduler.total_nthreads)
-                for g in self.compute.values():
-                    g.append(0.0)
+            g = self.groups[k]
 
-            # Get the task
-            task = self.scheduler.tasks[key]
-            group = task.group
+            if key not in self.keys[k]:
+                self.keys[k].add(key)
+            else:
+                g[start] -= 1
 
-            # If the group is new, add it to the timeseries as if it has been
-            # here the whole time
-            if group.name not in self.compute:
-                self.compute[group.name] = [0.0] * len(self.time)
+            if finish != "forgotten":
+                g[finish] += 1
+            else:
+                self.keys[k].remove(key)
+                if not self.keys[k]:
+                    del self.groups[k]
+                    del self.nbytes[k]
+                    for dep in self.dependencies.pop(k):
+                        self.dependents[key_split_group(dep)].remove(k)
 
-            for startstop in startstops:
-                if startstop["action"] != "compute":
-                    continue
-                stop = startstop["stop"]
-                start = startstop["start"]
-                idx = len(self.time) - 1
-                # If the stop time is after the most recent bin,
-                # roll back the current index. Not clear how often this happens.
-                while idx > 0 and self.time[idx - 1] > stop:
-                    idx -= 1
-                # Allocate the timing information of the task to the time bins.
-                while idx > 0 and stop > start:
-                    delta = stop - max(self.time[idx - 1], start)
-                    self.compute[group.name][idx] += delta
-
-                    stop -= delta
-                    idx -= 1
+            if start == "memory" and ts.nbytes >= 0:
+                self.nbytes[k] -= ts.nbytes
+            if finish == "memory" and ts.nbytes >= 0:
+                self.nbytes[k] += ts.nbytes
 
     def restart(self, scheduler):
-        self._init()
+        self.keys.clear()
+        self.groups.clear()
+        self.nbytes.clear()
+        self.durations.clear()
+        self.dependencies.clear()
+        self.dependents.clear()

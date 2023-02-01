@@ -1,13 +1,11 @@
-from __future__ import annotations
-
 import logging
 
 from dask.utils import stringify
 
-from distributed.client import futures_of, wait
-from distributed.utils import sync
-from distributed.utils_comm import pack_data
-from distributed.worker import _deserialize
+from .client import futures_of, wait
+from .utils import sync
+from .utils_comm import pack_data
+from .worker import _deserialize
 
 logger = logging.getLogger(__name__)
 
@@ -25,6 +23,7 @@ class ReplayTaskScheduler:
         self.scheduler = scheduler
         self.scheduler.handlers["get_runspec"] = self.get_runspec
         self.scheduler.handlers["get_error_cause"] = self.get_error_cause
+        self.scheduler.extensions["replay-tasks"] = self
 
     def _process_key(self, key):
         if isinstance(key, list):

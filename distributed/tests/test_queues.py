@@ -1,15 +1,13 @@
-from __future__ import annotations
-
 import asyncio
 from datetime import timedelta
 from time import sleep
 
 import pytest
 
-from distributed import Client, Nanny, Queue, TimeoutError, wait, worker_client
+from distributed import Client, Queue, Nanny, worker_client, wait, TimeoutError
 from distributed.metrics import time
-from distributed.utils import open_port
-from distributed.utils_test import div, gen_cluster, inc, popen
+from distributed.utils_test import gen_cluster, inc, div
+from distributed.utils_test import client, cluster_fixture, loop  # noqa: F401
 
 
 @gen_cluster(client=True)
@@ -70,20 +68,22 @@ def test_sync(client):
 
 @gen_cluster()
 async def test_hold_futures(s, a, b):
-    async with Client(s.address, asynchronous=True) as c1:
-        future = c1.submit(lambda x: x + 1, 10)
-        q1 = await Queue("q")
-        await q1.put(future)
-        del q1
+    c1 = await Client(s.address, asynchronous=True)
+    future = c1.submit(lambda x: x + 1, 10)
+    q1 = await Queue("q")
+    await q1.put(future)
+    del q1
+    await c1.close()
 
     await asyncio.sleep(0.1)
 
-    async with Client(s.address, asynchronous=True) as c1:
-        q2 = await Queue("q")
-        future2 = await q2.get()
-        result = await future2
+    c2 = await Client(s.address, asynchronous=True)
+    q2 = await Queue("q")
+    future2 = await q2.get()
+    result = await future2
 
-        assert result == 11
+    assert result == 11
+    await c2.close()
 
 
 @pytest.mark.skip(reason="getting same client from main thread")
@@ -111,7 +111,7 @@ def test_picklability_sync(client):
 
 
 @pytest.mark.slow
-@gen_cluster(client=True, nthreads=[("127.0.0.1", 2)] * 5, Worker=Nanny, timeout=60)
+@gen_cluster(client=True, nthreads=[("127.0.0.1", 2)] * 5, Worker=Nanny, timeout=None)
 async def test_race(c, s, *workers):
     def f(i):
         with worker_client() as c:
@@ -143,21 +143,21 @@ async def test_same_futures(c, s, a, b):
     q = Queue("x")
     future = await c.scatter(123)
 
-    for _ in range(5):
+    for i in range(5):
         await q.put(future)
 
-    assert {ts.key for ts in s.clients["queue-x"].wants_what} == {future.key}
+    assert s.wants_what["queue-x"] == {future.key}
 
-    for _ in range(4):
+    for i in range(4):
         future2 = await q.get()
-        assert {ts.key for ts in s.clients["queue-x"].wants_what} == {future.key}
+        assert s.wants_what["queue-x"] == {future.key}
         await asyncio.sleep(0.05)
-        assert {ts.key for ts in s.clients["queue-x"].wants_what} == {future.key}
+        assert s.wants_what["queue-x"] == {future.key}
 
     await q.get()
 
     start = time()
-    while "queue-x" in s.clients and s.clients["queue-x"].wants_what:
+    while s.wants_what["queue-x"]:
         await asyncio.sleep(0.01)
         assert time() - start < 2
 
@@ -191,29 +191,31 @@ async def test_Future_knows_status_immediately(c, s, a, b):
     q = await Queue("q")
     await q.put(x)
 
-    async with Client(s.address, asynchronous=True) as c2:
-        q2 = await Queue("q", client=c2)
-        future = await q2.get()
-        assert future.status == "finished"
+    c2 = await Client(s.address, asynchronous=True)
+    q2 = await Queue("q", client=c2)
+    future = await q2.get()
+    assert future.status == "finished"
 
-        x = c.submit(div, 1, 0)
-        await wait(x)
-        await q.put(x)
+    x = c.submit(div, 1, 0)
+    await wait(x)
+    await q.put(x)
 
-        future2 = await q2.get()
-        assert future2.status == "error"
-        with pytest.raises(Exception):
+    future2 = await q2.get()
+    assert future2.status == "error"
+    with pytest.raises(Exception):
+        await future2
+
+    start = time()
+    while True:  # we learn about the true error eventually
+        try:
             await future2
+        except ZeroDivisionError:
+            break
+        except Exception:
+            assert time() < start + 5
+            await asyncio.sleep(0.05)
 
-        start = time()
-        while True:  # we learn about the true error eventually
-            try:
-                await future2
-            except ZeroDivisionError:
-                break
-            except Exception:
-                assert time() < start + 5
-                await asyncio.sleep(0.05)
+    await c2.close()
 
 
 @gen_cluster(client=True)
@@ -274,30 +276,3 @@ async def test_2220(c, s, a, b):
     res = c.submit(get)
 
     await c.gather([res, fut])
-
-
-def test_queue_in_task(loop):
-    port = open_port()
-    # Ensure that we can create a Queue inside a task on a
-    # worker in a separate Python process than the client
-    with popen(
-        [
-            "dask",
-            "scheduler",
-            "--no-dashboard",
-            f"--port={port}",
-        ]
-    ):
-        with popen(["dask", "worker", f"127.0.0.1:{port}"]):
-            with Client(f"tcp://127.0.0.1:{port}", loop=loop) as c:
-                c.wait_for_workers(1)
-
-                x = Queue("x")
-                x.put(123)
-
-                def foo():
-                    y = Queue("x")
-                    return y.get()
-
-                result = c.submit(foo).result()
-                assert result == 123

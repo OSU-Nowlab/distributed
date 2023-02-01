@@ -1,7 +1,4 @@
-from __future__ import annotations
-
 import pytest
-
 from distributed.protocol import deserialize, serialize
 
 numpy = pytest.importorskip("numpy")

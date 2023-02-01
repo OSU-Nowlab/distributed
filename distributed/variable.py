@@ -1,25 +1,21 @@
-from __future__ import annotations
-
 import asyncio
-import logging
-import uuid
 from collections import defaultdict
 from contextlib import suppress
+import logging
+import uuid
 
 from tlz import merge
 
-from dask.utils import parse_timedelta, stringify
-
-from distributed.client import Client, Future
-from distributed.metrics import time
-from distributed.utils import TimeoutError, log_errors
-from distributed.worker import get_client, get_worker
+from dask.utils import stringify
+from .client import Future, Client
+from .utils import log_errors, TimeoutError, parse_timedelta
+from .worker import get_client
 
 logger = logging.getLogger(__name__)
 
 
 class VariableExtension:
-    """An extension for the scheduler to manage Variables
+    """An extension for the scheduler to manage queues
 
     This adds the following routes to the scheduler
 
@@ -42,7 +38,9 @@ class VariableExtension:
         self.scheduler.stream_handlers["variable-future-release"] = self.future_release
         self.scheduler.stream_handlers["variable_delete"] = self.delete
 
-    async def set(self, name=None, key=None, data=None, client=None):
+        self.scheduler.extensions["variables"] = self
+
+    async def set(self, comm=None, name=None, key=None, data=None, client=None):
         if key is not None:
             record = {"type": "Future", "value": key}
             self.scheduler.client_desires_keys(keys=[key], client="variable-%s" % name)
@@ -74,11 +72,11 @@ class VariableExtension:
             async with self.waiting_conditions[name]:
                 self.waiting_conditions[name].notify_all()
 
-    async def get(self, name=None, client=None, timeout=None):
-        start = time()
+    async def get(self, comm=None, name=None, client=None, timeout=None):
+        start = self.scheduler.loop.time()
         while name not in self.variables:
             if timeout is not None:
-                left = timeout - (time() - start)
+                left = timeout - (self.scheduler.loop.time() - start)
             else:
                 left = None
             if left and left < 0:
@@ -91,7 +89,8 @@ class VariableExtension:
 
                 await asyncio.wait_for(_(), timeout=left)
             finally:
-                self.started.release()
+                with suppress(RuntimeError):  # Python 3.6 loses lock on finally clause
+                    self.started.release()
 
         record = self.variables[name]
         if record["type"] == "Future":
@@ -107,21 +106,21 @@ class VariableExtension:
             self.waiting[key, name].add(token)
         return record
 
-    @log_errors
-    async def delete(self, name=None, client=None):
-        try:
-            old = self.variables[name]
-        except KeyError:
-            pass
-        else:
-            if old["type"] == "Future":
-                await self.release(old["value"], name)
-        with suppress(KeyError):
-            del self.waiting_conditions[name]
-        with suppress(KeyError):
-            del self.variables[name]
+    async def delete(self, comm=None, name=None, client=None):
+        with log_errors():
+            try:
+                old = self.variables[name]
+            except KeyError:
+                pass
+            else:
+                if old["type"] == "Future":
+                    await self.release(old["value"], name)
+            with suppress(KeyError):
+                del self.waiting_conditions[name]
+            with suppress(KeyError):
+                del self.variables[name]
 
-        self.scheduler.remove_client("variable-%s" % name)
+            self.scheduler.remove_client("variable-%s" % name)
 
 
 class Variable:
@@ -146,8 +145,8 @@ class Variable:
         Name used by other clients and the scheduler to identify the variable.
         If not given, a random name will be generated.
     client: Client (optional)
-        Client used for communication with the scheduler.
-        If not given, the default global client will be used.
+        Client used for communication with the scheduler. Defaults to the
+        value of ``Client.current()``.
 
     Examples
     --------
@@ -166,11 +165,7 @@ class Variable:
     """
 
     def __init__(self, name=None, client=None, maxsize=0):
-        try:
-            self.client = client or Client.current()
-        except ValueError:
-            # Initialise new client
-            self.client = get_worker().client
+        self.client = client or Client.current()
         self.name = name or "variable-" + uuid.uuid4().hex
 
     async def _set(self, value):
@@ -186,7 +181,7 @@ class Variable:
 
         Parameters
         ----------
-        value : Future or object
+        value: Future or object
             Must be either a Future or a msgpack-encodable value
         """
         return self.client.sync(self._set, value, **kwargs)
@@ -216,7 +211,7 @@ class Variable:
 
         Parameters
         ----------
-        timeout : number or string or timedelta, optional
+        timeout: number or string or timedelta, optional
             Time in seconds to wait before timing out.
             Instead of number of seconds, it is also possible to specify
             a timedelta in string format, e.g. "200ms".

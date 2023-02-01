@@ -1,29 +1,20 @@
-from __future__ import annotations
-
-import html
-import logging
-import sys
-import warnings
-import weakref
 from contextlib import suppress
+import logging
+import html
 from timeit import default_timer
+import sys
+import weakref
 
 from tlz import valmap
 from tornado.ioloop import IOLoop
 
-import dask
-from dask.utils import key_split
+from .progress import format_time, Progress, MultiProgress
 
-from distributed.client import default_client, futures_of
-from distributed.core import (
-    CommClosedError,
-    clean_exception,
-    coerce_to_address,
-    connect,
-)
-from distributed.diagnostics.progress import MultiProgress, Progress, format_time
-from distributed.protocol.pickle import dumps
-from distributed.utils import LoopRunner, is_kernel
+from ..core import connect, coerce_to_address, CommClosedError
+from ..client import default_client, futures_of
+from ..protocol.pickle import dumps
+from ..utils import key_split, is_kernel, LoopRunner, parse_timedelta
+
 
 logger = logging.getLogger(__name__)
 
@@ -45,7 +36,7 @@ class ProgressBar:
                 break
 
         self.keys = {k.key if hasattr(k, "key") else k for k in keys}
-        self.interval = dask.utils.parse_timedelta(interval, default="s")
+        self.interval = parse_timedelta(interval, default="s")
         self.complete = complete
         self._start_time = default_timer()
 
@@ -113,8 +104,6 @@ class ProgressBar:
 
 
 class TextProgressBar(ProgressBar):
-    __loop: IOLoop | None = None
-
     def __init__(
         self,
         keys,
@@ -126,30 +115,13 @@ class TextProgressBar(ProgressBar):
         start=True,
         **kwargs,
     ):
-        self._loop_runner = loop_runner = LoopRunner(loop=loop)
         super().__init__(keys, scheduler, interval, complete)
         self.width = width
+        self.loop = loop or IOLoop()
 
         if start:
+            loop_runner = LoopRunner(self.loop)
             loop_runner.run_sync(self.listen)
-
-    @property
-    def loop(self) -> IOLoop | None:
-        loop = self.__loop
-        if loop is None:
-            # If the loop is not running when this is called, the LoopRunner.loop
-            # property will raise a DeprecationWarning
-            # However subsequent calls might occur - eg atexit, where a stopped
-            # loop is still acceptable - so we cache access to the loop.
-            self.__loop = loop = self._loop_runner.loop
-        return loop
-
-    @loop.setter
-    def loop(self, value: IOLoop) -> None:
-        warnings.warn(
-            "setting the loop property is deprecated", DeprecationWarning, stacklevel=2
-        )
-        self.__loop = value
 
     def _draw_bar(self, remaining, all, **kwargs):
         frac = (1 - remaining / all) if all else 1.0
@@ -164,7 +136,7 @@ class TextProgressBar(ProgressBar):
             sys.stdout.flush()
 
     def _draw_stop(self, **kwargs):
-        sys.stdout.write("\33[2K\r")
+        sys.stdout.write("\r")
         sys.stdout.flush()
 
 
@@ -188,7 +160,7 @@ class ProgressWidget(ProgressBar):
     ):
         super().__init__(keys, scheduler, interval, complete)
 
-        from ipywidgets import HTML, FloatProgress, HBox, VBox
+        from ipywidgets import FloatProgress, HBox, VBox, HTML
 
         self.elapsed_time = HTML("")
         self.bar = FloatProgress(min=0, max=1, description="")
@@ -199,13 +171,10 @@ class ProgressWidget(ProgressBar):
 
     def _ipython_display_(self, **kwargs):
         IOLoop.current().add_callback(self.listen)
-        from IPython.display import display
-
-        display(self.widget, **kwargs)
+        return self.widget._ipython_display_(**kwargs)
 
     def _draw_stop(self, remaining, status, exception=None, **kwargs):
         if status == "error":
-            _, exception, _ = clean_exception(exception)
             self.bar.bar_style = "danger"
             self.elapsed_time.value = (
                 '<div style="padding: 0px 10px 5px 10px"><b>Exception</b> '
@@ -350,7 +319,7 @@ class MultiProgressWidget(MultiProgressBar):
         self.widget = VBox([])
 
     def make_widget(self, all):
-        from ipywidgets import HTML, FloatProgress, HBox, VBox
+        from ipywidgets import FloatProgress, HBox, VBox, HTML
 
         self.elapsed_time = HTML("")
         self.bars = {key: FloatProgress(min=0, max=1, description="") for key in all}
@@ -367,7 +336,7 @@ class MultiProgressWidget(MultiProgressBar):
         }
 
         def keyfunc(kv):
-            """Order keys by most numerous, then by string name"""
+            """ Order keys by most numerous, then by string name """
             return kv[::-1]
 
         key_order = [k for k, v in sorted(all.items(), key=keyfunc, reverse=True)]
@@ -382,9 +351,7 @@ class MultiProgressWidget(MultiProgressBar):
 
     def _ipython_display_(self, **kwargs):
         IOLoop.current().add_callback(self.listen)
-        from IPython.display import display
-
-        display(self.widget, **kwargs)
+        return self.widget._ipython_display_(**kwargs)
 
     def _draw_stop(self, remaining, status, exception=None, key=None, **kwargs):
         for k, v in remaining.items():
@@ -394,7 +361,6 @@ class MultiProgressWidget(MultiProgressBar):
                 self.bars[k].bar_style = "danger"
 
         if status == "error":
-            _, exception, _ = clean_exception(exception)
             # self.bars[self.func(key)].bar_style = 'danger'  # TODO
             self.elapsed_time.value = (
                 '<div style="padding: 0px 10px 5px 10px"><b>Exception</b> '
@@ -439,13 +405,13 @@ def progress(*futures, notebook=None, multi=True, complete=True, **kwargs):
 
     Parameters
     ----------
-    futures : Futures
+    futures: Futures
         A list of futures or keys to track
-    notebook : bool (optional)
+    notebook: bool (optional)
         Running in the notebook or not (defaults to guess)
-    multi : bool (optional)
+    multi: bool (optional)
         Track different functions independently (defaults to True)
-    complete : bool (optional)
+    complete: bool (optional)
         Track all keys (True) or only keys that have not yet run (False)
         (defaults to True)
 

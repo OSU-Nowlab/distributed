@@ -1,15 +1,13 @@
-from __future__ import annotations
-
 import weakref
 
 import numba.cuda
 import numpy as np
 
-from distributed.protocol.cuda import cuda_deserialize, cuda_serialize
-from distributed.protocol.serialize import dask_deserialize, dask_serialize
+from .cuda import cuda_deserialize, cuda_serialize
+from .serialize import dask_deserialize, dask_serialize
 
 try:
-    from distributed.protocol.rmm import dask_deserialize_rmm_device_buffer
+    from .rmm import dask_deserialize_rmm_device_buffer
 except ImportError:
     dask_deserialize_rmm_device_buffer = None
 
@@ -25,6 +23,7 @@ def cuda_serialize_numba_ndarray(x):
 
     header = x.__cuda_array_interface__.copy()
     header["strides"] = tuple(x.strides)
+    header["lengths"] = [x.nbytes]
     frames = [
         numba.cuda.cudadrv.devicearray.DeviceNDArray(
             shape=(x.nbytes,), strides=(1,), dtype=np.dtype("u1"), gpu_data=x.gpu_data
@@ -52,6 +51,7 @@ def cuda_deserialize_numba_ndarray(header, frames):
 @dask_serialize.register(numba.cuda.devicearray.DeviceNDArray)
 def dask_serialize_numba_ndarray(x):
     header, frames = cuda_serialize_numba_ndarray(x)
+    header["writeable"] = (None,) * len(frames)
     frames = [memoryview(f.copy_to_host()) for f in frames]
     return header, frames
 

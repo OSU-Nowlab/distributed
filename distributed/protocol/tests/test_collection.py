@@ -1,11 +1,7 @@
-from __future__ import annotations
-
 import pytest
-
-from distributed.protocol import deserialize, serialize
-
-np = pytest.importorskip("numpy")
-pd = pytest.importorskip("pandas")
+from distributed.protocol import serialize, deserialize
+import pandas as pd
+import numpy as np
 
 
 @pytest.mark.parametrize("collection", [tuple, dict, list])
@@ -23,7 +19,6 @@ def test_serialize_collection(collection, y, y_serializer):
         header, frames = serialize({"x": x, "y": y}, serializers=("dask", "pickle"))
     else:
         header, frames = serialize(collection((x, y)), serializers=("dask", "pickle"))
-    frames = tuple(frames)  # verify that no mutation occurs
     t = deserialize(header, frames, deserializers=("dask", "pickle", "error"))
     assert isinstance(t, collection)
 
@@ -52,4 +47,4 @@ def test_nested_types():
     header, frames = serialize([[[x]]])
     assert "dask" in str(header)
     assert len(frames) == 1
-    assert x.data == np.frombuffer(frames[0]).data
+    assert x.data in frames

@@ -1,42 +1,42 @@
-from __future__ import annotations
-
 import asyncio
-
 import pytest
 
 from dask import delayed
-
 from distributed import Client
 from distributed.client import futures_of
 from distributed.metrics import time
-from distributed.protocol import Serialized
 from distributed.utils_test import gen_cluster, inc
+from distributed.utils_test import client, cluster_fixture, loop  # noqa F401
+from distributed.protocol import Serialized
 
 
-@gen_cluster()
+@gen_cluster(client=False)
 async def test_publish_simple(s, a, b):
-    async with Client(s.address, asynchronous=True) as c, Client(
-        s.address, asynchronous=True
-    ) as f:
-        data = await c.scatter(range(3))
+    c = Client(s.address, asynchronous=True)
+    f = Client(s.address, asynchronous=True)
+    await asyncio.gather(c, f)
+
+    data = await c.scatter(range(3))
+    await c.publish_dataset(data=data)
+    assert "data" in s.extensions["publish"].datasets
+    assert isinstance(s.extensions["publish"].datasets["data"]["data"], Serialized)
+
+    with pytest.raises(KeyError) as exc_info:
         await c.publish_dataset(data=data)
-        assert "data" in s.extensions["publish"].datasets
-        assert isinstance(s.extensions["publish"].datasets["data"]["data"], Serialized)
 
-        with pytest.raises(KeyError) as exc_info:
-            await c.publish_dataset(data=data)
+    assert "exists" in str(exc_info.value)
+    assert "data" in str(exc_info.value)
 
-        assert "exists" in str(exc_info.value)
-        assert "data" in str(exc_info.value)
+    result = await c.scheduler.publish_list()
+    assert result == ("data",)
 
-        result = await c.scheduler.publish_list()
-        assert result == ("data",)
+    result = await f.scheduler.publish_list()
+    assert result == ("data",)
 
-        result = await f.scheduler.publish_list()
-        assert result == ("data",)
+    await asyncio.gather(c.close(), f.close())
 
 
-@gen_cluster()
+@gen_cluster(client=False)
 async def test_publish_non_string_key(s, a, b):
     async with Client(s.address, asynchronous=True) as c:
         for name in [("a", "b"), 9.0, 8]:
@@ -51,29 +51,29 @@ async def test_publish_non_string_key(s, a, b):
             assert name in datasets
 
 
-@gen_cluster()
+@gen_cluster(client=False)
 async def test_publish_roundtrip(s, a, b):
-    async with Client(s.address, asynchronous=True) as c, Client(
-        s.address, asynchronous=True
-    ) as f:
+    c = await Client(s.address, asynchronous=True)
+    f = await Client(s.address, asynchronous=True)
 
-        data = await c.scatter([0, 1, 2])
-        await c.publish_dataset(data=data)
+    data = await c.scatter([0, 1, 2])
+    await c.publish_dataset(data=data)
 
-        assert any(
-            cs.client_key == "published-data" for cs in s.tasks[data[0].key].who_wants
-        )
-        result = await f.get_dataset(name="data")
+    assert "published-data" in s.who_wants[data[0].key]
+    result = await f.get_dataset(name="data")
 
-        assert len(result) == len(data)
-        out = await f.gather(result)
-        assert out == [0, 1, 2]
+    assert len(result) == len(data)
+    out = await f.gather(result)
+    assert out == [0, 1, 2]
 
-        with pytest.raises(KeyError) as exc_info:
-            await f.get_dataset(name="nonexistent")
+    with pytest.raises(KeyError) as exc_info:
+        await f.get_dataset(name="nonexistent")
 
-        assert "not found" in str(exc_info.value)
-        assert "nonexistent" in str(exc_info.value)
+    assert "not found" in str(exc_info.value)
+    assert "nonexistent" in str(exc_info.value)
+
+    await c.close()
+    await f.close()
 
 
 @gen_cluster(client=True)
@@ -89,7 +89,7 @@ async def test_unpublish(c, s, a, b):
     assert "data" not in s.extensions["publish"].datasets
 
     start = time()
-    while key in s.tasks:
+    while key in s.who_wants:
         await asyncio.sleep(0.01)
         assert time() < start + 5
 
@@ -146,33 +146,32 @@ def test_unpublish_multiple_datasets_sync(client):
     assert "y" in str(exc_info.value)
 
 
-@gen_cluster()
+@gen_cluster(client=False)
 async def test_publish_bag(s, a, b):
     db = pytest.importorskip("dask.bag")
-    async with Client(s.address, asynchronous=True) as c, Client(
-        s.address, asynchronous=True
-    ) as f:
+    c = await Client(s.address, asynchronous=True)
+    f = await Client(s.address, asynchronous=True)
 
-        bag = db.from_sequence([0, 1, 2])
-        bagp = c.persist(bag)
+    bag = db.from_sequence([0, 1, 2])
+    bagp = c.persist(bag)
 
-        assert len(futures_of(bagp)) == 3
-        keys = {f.key for f in futures_of(bagp)}
-        assert keys == set(bag.dask)
+    assert len(futures_of(bagp)) == 3
+    keys = {f.key for f in futures_of(bagp)}
+    assert keys == set(bag.dask)
 
-        await c.publish_dataset(data=bagp)
+    await c.publish_dataset(data=bagp)
 
-        # check that serialization didn't affect original bag's dask
-        assert len(futures_of(bagp)) == 3
+    # check that serialization didn't affect original bag's dask
+    assert len(futures_of(bagp)) == 3
 
-        result = await f.get_dataset("data")
-        assert set(result.dask.keys()) == set(bagp.dask.keys())
-        assert {f.key for f in result.dask.values()} == {
-            f.key for f in bagp.dask.values()
-        }
+    result = await f.get_dataset("data")
+    assert set(result.dask.keys()) == set(bagp.dask.keys())
+    assert {f.key for f in result.dask.values()} == {f.key for f in bagp.dask.values()}
 
-        out = await f.compute(result)
-        assert out == [0, 1, 2]
+    out = await f.compute(result)
+    assert out == [0, 1, 2]
+    await c.close()
+    await f.close()
 
 
 def test_datasets_setitem(client):

@@ -1,17 +1,14 @@
-from __future__ import annotations
-
 import asyncio
 import operator
 
-from distributed import wait
-from distributed.diagnostics import GraphLayout
 from distributed.utils_test import gen_cluster, inc
+from distributed.diagnostics import GraphLayout
+from distributed import wait
 
 
 @gen_cluster(client=True)
 async def test_basic(c, s, a, b):
     gl = GraphLayout(s)
-    s.add_plugin(gl)
     futures = c.map(inc, range(5))
     total = c.submit(sum, futures)
 
@@ -31,7 +28,6 @@ async def test_construct_after_call(c, s, a, b):
     await total
 
     gl = GraphLayout(s)
-    s.add_plugin(gl)
 
     assert len(gl.x) == len(gl.y) == 6
     assert all(gl.x[f.key] == 0 for f in futures)
@@ -42,20 +38,21 @@ async def test_construct_after_call(c, s, a, b):
 @gen_cluster(client=True)
 async def test_states(c, s, a, b):
     gl = GraphLayout(s)
-    s.add_plugin(gl)
-    await c.submit(sum, c.map(inc, range(5)))
+    futures = c.map(inc, range(5))
+    total = c.submit(sum, futures)
+    del futures
 
-    while True:
-        updates = {state for _, state in gl.state_updates}
-        if updates == {"waiting", "processing", "memory", "released"}:
-            break
-        await asyncio.sleep(0.01)
+    await total
+
+    updates = {state for idx, state in gl.state_updates}
+    assert "memory" in updates
+    assert "processing" in updates
+    assert "released" in updates
 
 
 @gen_cluster(client=True)
 async def test_release_tasks(c, s, a, b):
     gl = GraphLayout(s)
-    s.add_plugin(gl)
     futures = c.map(inc, range(5))
     total = c.submit(sum, futures)
 
@@ -72,7 +69,6 @@ async def test_release_tasks(c, s, a, b):
 @gen_cluster(client=True)
 async def test_forget(c, s, a, b):
     gl = GraphLayout(s)
-    s.add_plugin(gl)
 
     futures = c.map(inc, range(10))
     futures = c.map(inc, futures)
@@ -91,7 +87,6 @@ async def test_forget(c, s, a, b):
 @gen_cluster(client=True)
 async def test_unique_positions(c, s, a, b):
     gl = GraphLayout(s)
-    s.add_plugin(gl)
 
     x = c.submit(inc, 1)
     ys = [c.submit(operator.add, x, i) for i in range(5)]

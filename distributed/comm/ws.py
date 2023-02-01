@@ -1,47 +1,25 @@
-from __future__ import annotations
-
 import asyncio
 import logging
 import struct
 import warnings
 import weakref
-from collections.abc import Callable
 from ssl import SSLError
-from typing import Any
+from typing import Callable
 
 from tornado import web
 from tornado.httpclient import HTTPClientError, HTTPRequest
 from tornado.httpserver import HTTPServer
 from tornado.iostream import StreamClosedError
-from tornado.websocket import (
-    WebSocketClientConnection,
-    WebSocketClosedError,
-    WebSocketHandler,
-    websocket_connect,
-)
+from tornado.websocket import WebSocketClosedError, WebSocketHandler, websocket_connect
 
 import dask
 
-from distributed.comm.addressing import parse_host_port, unparse_host_port
-from distributed.comm.core import (
-    Comm,
-    CommClosedError,
-    Connector,
-    FatalCommClosedError,
-    Listener,
-)
-from distributed.comm.registry import backends
-from distributed.comm.tcp import (
-    BaseTCPBackend,
-    _expect_tls_context,
-    convert_stream_closed_error,
-)
-from distributed.comm.utils import (
-    ensure_concrete_host,
-    from_frames,
-    get_tcp_server_address,
-    to_frames,
-)
+from ..utils import ensure_bytes, nbytes
+from .addressing import parse_host_port, unparse_host_port
+from .core import Comm, CommClosedError, Connector, FatalCommClosedError, Listener
+from .registry import backends
+from .tcp import BaseTCPBackend, _expect_tls_context, convert_stream_closed_error
+from .utils import ensure_concrete_host, from_frames, get_tcp_server_address, to_frames
 
 logger = logging.getLogger(__name__)
 
@@ -53,7 +31,7 @@ BIG_BYTES_SHARD_SIZE = dask.utils.parse_bytes(
 
 
 class WSHandler(WebSocketHandler):
-    def __init__(  # type: ignore[no-untyped-def]
+    def __init__(
         self,
         application,
         request,
@@ -105,15 +83,11 @@ class WSHandler(WebSocketHandler):
 
 
 class WSHandlerComm(Comm):
-    def __init__(
-        self,
-        handler: WSHandler,
-        deserialize: bool = True,
-        allow_offload: bool = True,
-    ):
+    def __init__(self, handler, deserialize=True, allow_offload=True):
         self.handler = handler
+        self.deserialize = deserialize
         self.allow_offload = allow_offload
-        super().__init__(deserialize=deserialize)
+        super().__init__()
 
     async def read(self, deserializers=None):
         try:
@@ -147,31 +121,33 @@ class WSHandlerComm(Comm):
             frame_split_size=BIG_BYTES_SHARD_SIZE,
         )
         n = struct.pack("Q", len(frames))
-        nbytes_frames = 0
         try:
             await self.handler.write_message(n, binary=True)
             for frame in frames:
-                if type(frame) is not bytes:
-                    frame = bytes(frame)
-                await self.handler.write_message(frame, binary=True)
-                nbytes_frames += len(frame)
+                await self.handler.write_message(ensure_bytes(frame), binary=True)
         except WebSocketClosedError as e:
             raise CommClosedError(str(e))
 
-        return nbytes_frames
+        return sum(map(nbytes, frames))
 
     def abort(self):
         self.handler.close()
 
     @property
-    def local_address(self) -> str:
+    def local_address(self):
         return self.handler.request.host
 
     @property
-    def peer_address(self) -> str:
-        ip = self.handler.request.remote_ip
-        assert isinstance(ip, str)
-        return ip + ":0"
+    def peer_address(self):
+        return self.handler.request.remote_ip + ":0"
+
+    @property
+    def _local_addr(self):
+        return self.handler.request.host
+
+    @property
+    def _peer_addr(self):
+        return self.handler.request.remote_ip + ":0"
 
     def closed(self):
         return (
@@ -188,26 +164,20 @@ class WSHandlerComm(Comm):
 class WS(Comm):
     prefix = "ws://"
 
-    def __init__(
-        self,
-        sock: WebSocketClientConnection,
-        deserialize: bool = True,
-        allow_offload: bool = True,
-    ):
+    def __init__(self, sock, deserialize=True, allow_offload=True):
         self._closed = False
-        super().__init__(deserialize=deserialize)
+        Comm.__init__(self)
         self.sock = sock
-        self._local_addr = f"{self.prefix}{self.sock.parsed.netloc}"
         self._peer_addr = f"{self.prefix}{self.sock.parsed.netloc}"
+        self._local_addr = f"{self.prefix}{self.sock.parsed.netloc}"
+        self.deserialize = deserialize
         self.allow_offload = allow_offload
         self._finalizer = weakref.finalize(self, self._get_finalizer())
-        self._extra: dict = {}
+        self._extra = {}
         self._read_extra()
 
     def _get_finalizer(self):
-        r = repr(self)
-
-        def finalize(sock=self.sock, r=r):
+        def finalize(sock=self.sock, r=repr(self)):
             if not sock.close_code:
                 logger.info("Closing dangling websocket in %s", r)
                 sock.close()
@@ -246,21 +216,16 @@ class WS(Comm):
                 "recipient": self.remote_info,
                 **self.handshake_options,
             },
-            frame_split_size=BIG_BYTES_SHARD_SIZE,
         )
         n = struct.pack("Q", len(frames))
-        nbytes_frames = 0
         try:
             await self.sock.write_message(n, binary=True)
             for frame in frames:
-                if type(frame) is not bytes:
-                    frame = bytes(frame)
-                await self.sock.write_message(frame, binary=True)
-                nbytes_frames += len(frame)
+                await self.sock.write_message(ensure_bytes(frame), binary=True)
         except WebSocketClosedError as e:
             raise CommClosedError(e)
 
-        return nbytes_frames
+        return sum(map(nbytes, frames))
 
     async def close(self):
         if not self.sock.close_code:
@@ -278,11 +243,11 @@ class WS(Comm):
         return not self.sock or self.sock.close_code or self._closed
 
     @property
-    def local_address(self) -> str:
+    def local_address(self):
         return f"{self.prefix}{self.sock.parsed.netloc}"
 
     @property
-    def peer_address(self) -> str:
+    def peer_address(self):
         return f"{self.prefix}{self.sock.parsed.netloc}"
 
     def _read_extra(self):
@@ -318,9 +283,9 @@ class WSListener(Listener):
         self,
         address: str,
         handler: Callable,
-        deserialize: bool = True,
-        allow_offload: bool = False,
-        **connection_args: Any,
+        deserialize=True,
+        allow_offload=False,
+        **connection_args,
     ):
         if not address.startswith(self.prefix):
             address = f"{self.prefix}{address}"
@@ -379,7 +344,7 @@ class WSListener(Listener):
                 self.server = HTTPServer(web.Application(routes), **self.server_args)
                 self.server.listen(self.port)
 
-    def stop(self):
+    async def stop(self):
         self.server.stop()
 
     def get_host_port(self):
@@ -441,18 +406,8 @@ class WSSConnector(WSConnector):
     comm_class = WSS
 
     def _get_connect_args(self, **connection_args):
-        wss_args = {
-            "ssl_options": connection_args.get("ssl_context"),
-            **connection_args.get("extra_conn_args", {}),
-        }
-
-        if connection_args.get("server_hostname"):
-            wss_args["headers"] = {
-                **wss_args.get("headers", {}),
-                **{"Host": connection_args["server_hostname"]},
-            }
-
-        return wss_args
+        ctx = connection_args.get("ssl_context")
+        return {"ssl_options": ctx, **connection_args.get("extra_conn_args", {})}
 
 
 class WSBackend(BaseTCPBackend):

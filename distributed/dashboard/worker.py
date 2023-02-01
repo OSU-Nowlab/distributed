@@ -1,17 +1,18 @@
-from __future__ import annotations
-
-from tornado.ioloop import IOLoop
-
-from distributed.dashboard.components.worker import (
+from .components.worker import (
+    status_doc,
+    crossfilter_doc,
+    systemmonitor_doc,
     counters_doc,
     profile_doc,
     profile_server_doc,
-    status_doc,
-    systemmonitor_doc,
 )
-from distributed.dashboard.core import BokehApplication
+from .core import BokehApplication
+from tornado.ioloop import IOLoop
 
-template_variables = {"pages": ["status", "system", "profile", "profile-server"]}
+
+template_variables = {
+    "pages": ["status", "system", "profile", "crossfilter", "profile-server"]
+}
 
 
 def connect(application, http_server, worker, prefix=""):
@@ -20,12 +21,12 @@ def connect(application, http_server, worker, prefix=""):
     )
     application.add_application(bokeh_app)
     bokeh_app.initialize(IOLoop.current())
-    bokeh_app.start()
 
 
 applications = {
     "/status": status_doc,
     "/counters": counters_doc,
+    "/crossfilter": crossfilter_doc,
     "/system": systemmonitor_doc,
     "/profile": profile_doc,
     "/profile-server": profile_server_doc,

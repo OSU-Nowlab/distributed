@@ -1,13 +1,8 @@
-from __future__ import annotations
-
 import dask
-from dask.utils import typename
 
-from distributed.protocol import pickle
-from distributed.protocol.serialize import (
-    ObjectDictSerializer,
-    register_serialization_family,
-)
+from . import pickle
+from .serialize import ObjectDictSerializer, register_serialization_family
+from dask.utils import typename
 
 cuda_serialize = dask.utils.Dispatch("cuda_serialize")
 cuda_deserialize = dask.utils.Dispatch("cuda_deserialize")
@@ -20,20 +15,17 @@ def cuda_dumps(x):
     except TypeError:
         raise NotImplementedError(type_name)
 
-    sub_header, frames = dumps(x)
-    header = {
-        "sub-header": sub_header,
-        "type-serialized": pickle.dumps(type(x)),
-        "serializer": "cuda",
-        "compression": (False,) * len(frames),  # no compression for gpu data
-    }
+    header, frames = dumps(x)
+    header["type-serialized"] = pickle.dumps(type(x))
+    header["serializer"] = "cuda"
+    header["compression"] = (False,) * len(frames)  # no compression for gpu data
     return header, frames
 
 
 def cuda_loads(header, frames):
     typ = pickle.loads(header["type-serialized"])
     loads = cuda_deserialize.dispatch(typ)
-    return loads(header["sub-header"], frames)
+    return loads(header, frames)
 
 
 register_serialization_family("cuda", cuda_dumps, cuda_loads)

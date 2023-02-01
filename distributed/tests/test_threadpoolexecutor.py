@@ -1,10 +1,8 @@
-from __future__ import annotations
-
-import threading
 from time import sleep
+import threading
 
 from distributed.metrics import time
-from distributed.threadpoolexecutor import ThreadPoolExecutor, rejoin, secede
+from distributed.threadpoolexecutor import ThreadPoolExecutor, secede, rejoin
 
 
 def test_tpe():
@@ -64,16 +62,11 @@ def test_shutdown_wait():
 
 def test_secede_rejoin_busy():
     with ThreadPoolExecutor(2) as e:
-        # Prime threads
-        f1 = e.submit(sleep, 0.1)
-        f2 = e.submit(sleep, 0.1)
-        f1.result()
-        f2.result()
 
         def f():
             assert threading.current_thread() in e._threads
             secede()
-            sleep(0.2)
+            sleep(0.1)
             assert threading.current_thread() not in e._threads
             rejoin()
             assert len(e._threads) == 2
@@ -81,13 +74,12 @@ def test_secede_rejoin_busy():
             return threading.current_thread()
 
         future = e.submit(f)
-        for _ in range(6):
-            e.submit(sleep, 0.4)
+        L = [e.submit(sleep, 0.2) for i in range(10)]
         start = time()
         special_thread = future.result()
         stop = time()
 
-        assert 0.2 < stop - start < 0.6
+        assert 0.1 < stop - start < 0.3
 
         assert len(e._threads) == 2
         assert special_thread in e._threads
@@ -122,7 +114,7 @@ def test_rejoin_idempotent():
 
         def f():
             secede()
-            for _ in range(5):
+            for i in range(5):
                 rejoin()
             return 1
 

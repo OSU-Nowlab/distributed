@@ -1,5 +1,3 @@
-from __future__ import annotations
-
 import asyncio
 import re
 from operator import add, sub
@@ -12,16 +10,17 @@ from tlz import first
 from tornado.httpclient import AsyncHTTPClient
 
 from distributed.client import wait
-from distributed.dashboard.components.worker import (
-    CommunicatingStream,
-    CommunicatingTimeSeries,
-    Counters,
-    ExecutingTimeSeries,
-    StateTable,
-    SystemMonitor,
-)
 from distributed.metrics import time
-from distributed.utils_test import dec, gen_cluster, inc
+from distributed.utils_test import gen_cluster, inc, dec
+from distributed.dashboard.components.worker import (
+    StateTable,
+    CrossFilter,
+    CommunicatingStream,
+    ExecutingTimeSeries,
+    CommunicatingTimeSeries,
+    SystemMonitor,
+    Counters,
+)
 
 
 @gen_cluster(
@@ -56,8 +55,11 @@ async def test_simple(c, s, a, b):
     await asyncio.sleep(0.1)
 
     http_client = AsyncHTTPClient()
-    response = await http_client.fetch(f"http://localhost:{a.http_server.port}/system")
-    assert "bokeh" in response.body.decode().lower()
+    for suffix in ["crossfilter", "system"]:
+        response = await http_client.fetch(
+            "http://localhost:%d/%s" % (a.http_server.port, suffix)
+        )
+        assert "bokeh" in response.body.decode().lower()
 
 
 @gen_cluster(client=True, worker_kwargs={"dashboard": True})
@@ -65,35 +67,35 @@ async def test_services_kwargs(c, s, a, b):
     assert s.workers[a.address].services == {"dashboard": a.http_server.port}
 
 
-@pytest.mark.slow
-@pytest.mark.parametrize(
-    "cls",
-    (
+@gen_cluster(client=True)
+async def test_basic(c, s, a, b):
+    for component in [
         StateTable,
         ExecutingTimeSeries,
         CommunicatingTimeSeries,
+        CrossFilter,
         SystemMonitor,
-    ),
-)
-@gen_cluster(client=True)
-async def test_basic(c, s, a, b, cls):
-    aa = cls(a)
-    bb = cls(b)
+    ]:
 
-    xs = c.map(inc, range(10), workers=a.address)
-    ys = c.map(dec, range(10), workers=b.address)
+        aa = component(a)
+        bb = component(b)
 
-    def slowall(*args):
-        sleep(1)
+        xs = c.map(inc, range(10), workers=a.address)
+        ys = c.map(dec, range(10), workers=b.address)
 
-    x = c.submit(slowall, xs, ys, 1, workers=a.address)
-    y = c.submit(slowall, xs, ys, 2, workers=b.address)
-    await asyncio.sleep(0.1)
+        def slowall(*args):
+            sleep(1)
 
-    aa.update()
-    bb.update()
+        x = c.submit(slowall, xs, ys, 1, workers=a.address)
+        y = c.submit(slowall, xs, ys, 2, workers=b.address)
+        await asyncio.sleep(0.1)
 
-    assert len(first(aa.source.data.values())) and len(first(bb.source.data.values()))
+        aa.update()
+        bb.update()
+
+        assert len(first(aa.source.data.values())) and len(
+            first(bb.source.data.values())
+        )
 
 
 @gen_cluster(client=True)
@@ -142,11 +144,11 @@ async def test_CommunicatingStream(c, s, a, b):
     aa.update()
     bb.update()
 
-    assert len(first(aa.transfer_outgoing.data.values())) and len(
-        first(bb.transfer_outgoing.data.values())
+    assert len(first(aa.outgoing.data.values())) and len(
+        first(bb.outgoing.data.values())
     )
-    assert len(first(aa.transfer_incoming.data.values())) and len(
-        first(bb.transfer_incoming.data.values())
+    assert len(first(aa.incoming.data.values())) and len(
+        first(bb.incoming.data.values())
     )
 
 

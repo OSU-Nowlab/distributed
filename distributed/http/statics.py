@@ -1,8 +1,5 @@
-from __future__ import annotations
-
-import os
-
 from tornado import web
+import os
 
 routes = [
     (

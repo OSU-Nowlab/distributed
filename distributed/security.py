@@ -1,57 +1,16 @@
-from __future__ import annotations
-
 import datetime
-import os
-import ssl
-import sys
 import tempfile
-import warnings
+import os
+
+try:
+    import ssl
+except ImportError:
+    ssl = None
 
 import dask
-from dask.widgets import get_template
+
 
 __all__ = ("Security",)
-
-
-if sys.version_info >= (3, 10) or ssl.OPENSSL_VERSION_INFO >= (1, 1, 0, 7):
-    # The OP_NO_SSL* and OP_NO_TLS* become deprecated in favor of
-    # 'SSLContext.minimum_version' from Python 3.7 onwards, however
-    # this attribute is not available unless the ssl module is compiled
-    # with OpenSSL 1.1.0g or newer.
-    # https://docs.python.org/3.10/library/ssl.html#ssl.SSLContext.minimum_version
-    # https://docs.python.org/3.7/library/ssl.html#ssl.SSLContext.minimum_version
-
-    # these _set_mimimun_version and _set_maximum_version depend on the validation
-    # already performed in `Security._set_tls_version_field`,
-    # and that they only apply to freshly created ssl.SSLContext instances in
-    # _get_tls_context
-    def _set_minimum_version(ctx: ssl.SSLContext, version: ssl.TLSVersion) -> None:
-        ctx.minimum_version = version
-
-    def _set_maximum_version(ctx: ssl.SSLContext, version: ssl.TLSVersion) -> None:
-        ctx.maximum_version = version
-
-else:
-
-    def _set_minimum_version(ctx: ssl.SSLContext, version: ssl.TLSVersion) -> None:
-        # if the ctx.maximum_version attribute is unsupported then we can infer
-        # that TLS 1.3 is not supported.
-        # _set_tls_version_field enforces that version is TLSVersion.TLSv1_2,
-        # or TLSVersion.TLSv1_3
-        if version is not ssl.TLSVersion.TLSv1_2:
-            raise ValueError(f"Unsupported TLS/SSL version: {version!r}")
-        ctx.options |= (
-            ssl.OP_NO_SSLv2 | ssl.OP_NO_SSLv3 | ssl.OP_NO_TLSv1 | ssl.OP_NO_TLSv1_1
-        )
-
-    def _set_maximum_version(ctx: ssl.SSLContext, version: ssl.TLSVersion) -> None:
-        # if the ctx.maximum_version attribute is unsupported then we can infer
-        # that TLSv1_3 is not supported.
-        # _set_tls_version_field enforces that version is TLSVersion.TLSv1_2,
-        # TLSVersion.TLSv1_3, or None
-        # _get_tls_context enforces that version is not None
-        if version is not ssl.TLSVersion.TLSv1_2:
-            raise ValueError(f"Unsupported TLS/SSL version: {version!r}")
 
 
 class Security:
@@ -69,11 +28,6 @@ class Security:
     tls_ciphers : str, optional
         An OpenSSL cipher string of allowed ciphers. If not provided, the
         system defaults will be used.
-    tls_min_version : ssl.TLSVersion, optional
-        The minimum TLS version to support. Defaults to TLS 1.2.
-    tls_max_version : ssl.TLSVersion, optional
-        The maximum TLS version to support. Defaults to the maximum version
-        supported.
     tls_client_cert : str, optional
         Path to a certificate file for the client, encoded in PEM format.
     tls_client_key : str, optional
@@ -92,53 +46,30 @@ class Security:
         Path to a key file for a worker, encoded in PEM format.
         Alternatively, the key may be appended to the cert file, and this
         parameter be omitted.
-    extra_conn_args : mapping, optional
-        Mapping with keyword arguments to pass down to connections.
     """
 
     __slots__ = (
         "require_encryption",
         "tls_ca_file",
         "tls_ciphers",
-        "tls_min_version",
-        "tls_max_version",
         "tls_client_key",
         "tls_client_cert",
         "tls_scheduler_key",
         "tls_scheduler_cert",
         "tls_worker_key",
         "tls_worker_cert",
-        "extra_conn_args",
     )
 
     def __init__(self, require_encryption=None, **kwargs):
-        if ssl.OPENSSL_VERSION_INFO < (1, 1, 1):
-            warnings.warn(
-                f"support for {ssl.OPENSSL_VERSION} is deprecated,"
-                " and will be removed in a future release",
-                DeprecationWarning,
-            )
         extra = set(kwargs).difference(self.__slots__)
         if extra:
             raise TypeError("Unknown parameters: %r" % sorted(extra))
-        self.extra_conn_args = kwargs.pop("extra_conn_args", {})
         if require_encryption is None:
             require_encryption = dask.config.get("distributed.comm.require-encryption")
         if require_encryption is None:
-            require_encryption = bool(kwargs)
+            require_encryption = not not kwargs
         self.require_encryption = require_encryption
         self._set_field(kwargs, "tls_ciphers", "distributed.comm.tls.ciphers")
-        self._set_tls_version_field(
-            kwargs,
-            "tls_min_version",
-            "distributed.comm.tls.min-version",
-            ssl.TLSVersion.TLSv1_2,
-        )
-        self._set_tls_version_field(
-            kwargs,
-            "tls_max_version",
-            "distributed.comm.tls.max-version",
-        )
         self._set_field(kwargs, "tls_ca_file", "distributed.comm.tls.ca-file")
         self._set_field(kwargs, "tls_client_key", "distributed.comm.tls.client.key")
         self._set_field(kwargs, "tls_client_cert", "distributed.comm.tls.client.cert")
@@ -152,7 +83,7 @@ class Security:
         self._set_field(kwargs, "tls_worker_cert", "distributed.comm.tls.worker.cert")
 
     @classmethod
-    def temporary(cls, **kwargs):
+    def temporary(cls):
         """Create a new temporary Security object.
 
         This creates a new self-signed key/cert pair suitable for securing
@@ -164,7 +95,8 @@ class Security:
         try:
             from cryptography import x509
             from cryptography.hazmat.backends import default_backend
-            from cryptography.hazmat.primitives import hashes, serialization
+            from cryptography.hazmat.primitives import hashes
+            from cryptography.hazmat.primitives import serialization
             from cryptography.hazmat.primitives.asymmetric import rsa
             from cryptography.x509.oid import NameOID
         except ImportError:
@@ -209,77 +141,33 @@ class Security:
             tls_scheduler_cert=cert_contents,
             tls_worker_key=key_contents,
             tls_worker_cert=cert_contents,
-            **kwargs,
         )
 
     def _set_field(self, kwargs, field, config_name):
         if field in kwargs:
-            val = kwargs[field]
+            out = kwargs[field]
         else:
-            val = dask.config.get(config_name)
-        setattr(self, field, val)
+            out = dask.config.get(config_name)
+        setattr(self, field, out)
 
-    def _set_tls_version_field(self, kwargs, field, config_name, default=None):
-        if field in kwargs:
-            val = kwargs[field]
-            valid = {None, ssl.TLSVersion.TLSv1_2, ssl.TLSVersion.TLSv1_3}
-            if val not in valid:
-                raise ValueError(
-                    f"{field}={val!r} is not supported, expected one of {list(valid)}"
-                )
-            if val is None:
-                val = default
-        else:
-            valid = {
-                None: default,
-                1.2: ssl.TLSVersion.TLSv1_2,
-                1.3: ssl.TLSVersion.TLSv1_3,
-            }
-            val = dask.config.get(config_name)
-            if val in valid:
-                val = valid[val]
-            else:
-                raise ValueError(
-                    f"{config_name}={val!r} is not supported, expected one of {list(valid)}"
-                )
-
-        setattr(self, field, val)
-
-    def _attr_to_dict(self):
+    def __repr__(self):
         keys = sorted(self.__slots__)
-        keys.remove("extra_conn_args")
-
-        attr = {}
-
+        items = []
         for k in keys:
             val = getattr(self, k)
             if val is not None:
                 if isinstance(val, str) and "\n" in val:
-                    attr[k] = "Temporary (In-memory)"
-                elif isinstance(val, str):
-                    attr[k] = f"Local ({os.path.abspath(val)})"
+                    items.append((k, "..."))
                 else:
-                    attr[k] = val
-
-        return attr
-
-    def __repr__(self):
-        attr = self._attr_to_dict()
-        return (
-            "Security("
-            + ", ".join(f"{key}={value}" for key, value in attr.items())
-            + ")"
-        )
-
-    def _repr_html_(self):
-        return get_template("security.html.j2").render(security=self._attr_to_dict())
+                    items.append((k, repr(val)))
+        return "Security(" + ", ".join("%s=%s" % (k, v) for k, v in items) + ")"
 
     def get_tls_config_for_role(self, role):
         """
         Return the TLS configuration for the given role, as a flat dict.
         """
         if role not in {"client", "scheduler", "worker"}:
-            raise ValueError(f"unknown role {role!r}")
+            raise ValueError("unknown role %r" % (role,))
         return {
             "ca_file": self.tls_ca_file,
             "ciphers": self.tls_ciphers,
@@ -297,12 +185,6 @@ class Security:
                 ctx = ssl.create_default_context(purpose=purpose, cadata=ca)
             else:
                 ctx = ssl.create_default_context(purpose=purpose, cafile=ca)
-
-            # the _set_tls_version_field method enforces that
-            # self.tls_min_version is TLSv1_2, or TLSv1_3
-            _set_minimum_version(ctx, self.tls_min_version)
-            if self.tls_max_version is not None:
-                _set_maximum_version(ctx, self.tls_max_version)
 
             cert_in_memory = "\n" in cert
             key_in_memory = key is not None and "\n" in key
@@ -341,7 +223,6 @@ class Security:
         return {
             "ssl_context": self._get_tls_context(tls, ssl.Purpose.SERVER_AUTH),
             "require_encryption": self.require_encryption,
-            "extra_conn_args": self.extra_conn_args,
         }
 
     def get_listen_args(self, role):

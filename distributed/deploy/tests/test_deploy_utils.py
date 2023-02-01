@@ -1,5 +1,3 @@
-from __future__ import annotations
-
 from distributed.deploy.utils import nprocesses_nthreads
 
 
